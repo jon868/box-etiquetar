@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 3
+Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 4
 alegria-activity
 
 Uso:
@@ -40,7 +40,7 @@ except ImportError:
 
 load_dotenv()
 
-VERSION = "v3"
+VERSION = "v4"
 
 # ---------------------------------------------------------------- configuración
 API = "https://api.box.com/2.0"
@@ -106,7 +106,7 @@ roadshows y exposiciones itinerantes en vehículos de flota propia, y que ademá
 medida para clientes. Catalogas fotos del archivo de la agencia para poder encontrarlas después al preparar \
 propuestas comerciales y la web.
 
-Usa SIEMPRE la herramienta guardar_ficha, una sola vez por foto. Usa exactamente los valores permitidos de cada \
+Llama directamente a la herramienta guardar_ficha, una sola vez por foto, sin escribir texto antes. Usa exactamente los valores permitidos de cada \
 lista, sin inventar otros. Reglas:
 
 1. Describe solo lo que se ve. Si dudas, usa "desconocido" o confianza "baja". Nunca inventes.
@@ -137,6 +137,8 @@ HERRAMIENTA = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "descripcion": {"type": "string"},
+            "palabras_clave": {"type": "array", "items": {"type": "string"}},
             "vehiculo": {"type": "string", "enum": FLOTA + ["otro vehículo", "sin vehículo", "desconocido"]},
             "tipo_vehiculo": {"type": "string", "enum": TIPOS_VEHICULO},
             "plano": {"type": "string", "enum": [
@@ -150,8 +152,6 @@ HERRAMIENTA = {
             "posibles_menores": {"type": "string", "enum": ["sí", "no", "dudoso"]},
             "calidad": {"type": "string", "enum": ["alta", "media", "baja"]},
             "apta_propuesta": {"type": "boolean"},
-            "descripcion": {"type": "string"},
-            "palabras_clave": {"type": "array", "items": {"type": "string"}},
             "confianza": {"type": "string", "enum": ["alta", "media", "baja"]},
         },
         "required": ["vehiculo", "tipo_vehiculo", "plano", "lineas_servicio", "marca_visible", "fuente_marca",
@@ -416,8 +416,15 @@ def cmd_enviar(args):
         sys.exit("No hay manifest. Ejecuta primero: python etiquetar.py listar")
     modelos = modelos_activos(args)
     lotes = leer_json(LOTES, {}) or {}
+    solo = getattr(args, "solo_incompletas", False)
+    if solo:
+        pendientes = pendientes_de_repetir(modelos)
+        fotos = [f for f in fotos if f["id"] in pendientes]
+        print(f"Repitiendo {len(fotos)} fotos incompletas o con error (se fusionan con las buenas al recoger).")
+        if not fotos:
+            sys.exit("No hay fotos que repetir.")
     repetidos = [m for m in modelos if m in lotes]
-    if repetidos and not args.forzar:
+    if repetidos and not args.forzar and not solo:
         sys.exit(f"Ya hay lote para {', '.join(repetidos)}. Usa --forzar para sustituirlo "
                  f"(o --modelos para enviar solo otros).")
 
@@ -481,7 +488,7 @@ def cmd_enviar(args):
     # 3) enviar lote a lote, construyendo las peticiones solo de ese lote
     cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
     for modelo in modelos:
-        lotes[modelo] = []
+        lotes[modelo] = ids_lote(lotes[modelo]) if (solo and modelo in lotes) else []
         for k, grupo in enumerate(grupos, 1):
             peticiones = []
             for foto in grupo:
@@ -495,7 +502,7 @@ def cmd_enviar(args):
                     "custom_id": f"f_{foto['id']}",
                     "params": {
                         "model": modelo,
-                        "max_tokens": 1500,
+                        "max_tokens": 3000,
                         "system": [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
                         "tools": [HERRAMIENTA],
                         "tool_choice": {"type": "auto"},
@@ -540,6 +547,20 @@ def cmd_estado(_args):
     estados(anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY")), lotes)
 
 
+def pendientes_de_repetir(modelos):
+    """Fotos cuya última ficha (de alguno de esos modelos) está incompleta o falló."""
+    if not RESULTADOS_JSONL.exists():
+        sys.exit("No hay resultados todavía: ejecuta antes 'recoger'.")
+    estado = {}
+    for linea in RESULTADOS_JSONL.read_text(encoding="utf-8").splitlines():
+        c = json.loads(linea)
+        if c.get("modelo") not in modelos:
+            continue
+        mal = "error" in c or bool(incompleta(c.get("ficha") or {}))
+        estado[(c["modelo"], c["file_id"])] = mal
+    return {fid for (_, fid), mal in estado.items() if mal}
+
+
 def resultados_de(cliente, valor):
     for lote_id in ids_lote(valor):
         yield from cliente.messages.batches.results(lote_id)
@@ -555,51 +576,58 @@ def cmd_recoger(_args):
     if any(b.processing_status != "ended" for b in st.values()):
         sys.exit("Todavía hay lotes en curso. Vuelve a probar más tarde.")
 
-    campos = ["file_id", "nombre", "carpetas", "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
+    campos = ["file_id", "nombre", "carpetas", "cliente_carpeta", "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
               "linea_principal", "lineas_servicio", "marca_visible", "fuente_marca", "personas",
               "posibles_menores", "calidad", "apta_propuesta", "descripcion", "palabras_clave", "confianza",
-              "fuera_de_lista", "incompleta", "marca_en_carpeta", "uso_autorizado", "coste_usd", "version", "revision_ok", "notas_revision"]
-    filas, crudo = [], []
-    coste_modelo, errores, motivos = Counter(), Counter(), {}
+              "fuera_de_lista", "incompleta", "fin", "marca_en_carpeta", "uso_autorizado", "coste_usd", "version", "revision_ok", "notas_revision"]
+    mejor = {}  # (modelo, file_id) -> (puntuación, fila o None, registro crudo)
+    coste_modelo, motivos = Counter(), {}
+
+    def guardar(clave, punt, fila, reg):
+        if clave not in mejor or punt >= mejor[clave][0]:
+            mejor[clave] = (punt, fila, reg)
+
     for modelo, valor in lotes.items():
         pin, pout = precio(modelo)
         for r in resultados_de(cliente, valor):
             file_id = r.custom_id.split("_", 1)[1]
             foto = fotos.get(file_id, {"nombre": "?", "ruta": ""})
+            clave = (modelo, file_id)
             if r.result.type != "succeeded":
-                errores[modelo] += 1
                 motivo = r.result.type
                 err = getattr(r.result, "error", None)
                 if err is not None:
                     interno = getattr(err, "error", err)
                     motivo = f"{r.result.type}: {getattr(interno, 'message', interno)}"
                 motivos.setdefault(modelo, motivo)
-                crudo.append({"modelo": modelo, "file_id": file_id, "error": motivo})
+                guardar(clave, 0, None, {"modelo": modelo, "file_id": file_id, "error": motivo})
                 continue
             msg = r.result.message
+            u = msg.usage
+            tin = (u.input_tokens + (u.cache_creation_input_tokens or 0) * 1.25
+                   + (u.cache_read_input_tokens or 0) * 0.1)
+            coste = (tin * pin + u.output_tokens * pout) / 1e6
+            coste_modelo[modelo] += coste
+            fin_resp = getattr(msg, "stop_reason", "") or ""
             ficha = next((b.input for b in msg.content if b.type == "tool_use"), None)
             if ficha is None:  # sin herramienta: intentar leer un JSON del texto
                 texto = "".join(getattr(b, "text", "") for b in msg.content)
                 try:
                     ficha = json.loads(texto[texto.index("{"): texto.rindex("}") + 1])
                 except ValueError:
-                    errores[modelo] += 1
-                    motivos.setdefault(modelo, "respuesta sin ficha")
-                    crudo.append({"modelo": modelo, "file_id": file_id, "error": "sin ficha", "texto": texto[:500]})
+                    motivos.setdefault(modelo, f"respuesta sin ficha (fin: {fin_resp})")
+                    guardar(clave, 0, None, {"modelo": modelo, "file_id": file_id, "error": "sin ficha",
+                                             "fin": fin_resp, "texto": texto[:500]})
                     continue
             ficha = dict(ficha)
             fuera = normalizar(ficha)
             faltan = incompleta(ficha)
-            u = msg.usage
-            tin = (u.input_tokens + (u.cache_creation_input_tokens or 0) * 1.25
-                   + (u.cache_read_input_tokens or 0) * 0.1)
-            coste = (tin * pin + u.output_tokens * pout) / 1e6
-            coste_modelo[modelo] += coste
-            crudo.append({"modelo": modelo, "file_id": file_id, "ficha": ficha, "fuera_de_lista": fuera})
             lineas = ficha.get("lineas_servicio") or []
-            filas.append({
+            primera = next((x for x in rutas(foto) if x), "")
+            fila = {
                 "file_id": file_id, "nombre": foto["nombre"],
-                "carpetas": " | ".join(r or "(raíz)" for r in rutas(foto)),
+                "carpetas": " | ".join(x or "(raíz)" for x in rutas(foto)),
+                "cliente_carpeta": primera.split("/")[0] if INCLUIR_RUTA else "",
                 "enlace_box": f"https://app.box.com/file/{file_id}", "modelo": modelo,
                 **{k: ficha.get(k, "") for k in PROPS},
                 "linea_principal": lineas[0] if lineas else "",
@@ -607,12 +635,21 @@ def cmd_recoger(_args):
                 "palabras_clave": ", ".join(ficha.get("palabras_clave", []) or []),
                 "fuera_de_lista": "; ".join(fuera),
                 "incompleta": ", ".join(faltan),
-                "marca_en_carpeta": {True: "sí", False: "no", None: ""}[marca_en_carpeta(ficha.get("marca_visible", ""), foto)]
-                if INCLUIR_RUTA else "",
+                "fin": fin_resp,
+                "marca_en_carpeta": {True: "sí", False: "no", None: ""}[
+                    marca_en_carpeta(ficha.get("marca_visible", ""), foto)] if INCLUIR_RUTA else "",
                 "uso_autorizado": "publicada en web" if CARPETA_RAIZ == "379464633435" else "pendiente",
                 "coste_usd": f"{coste:.5f}", "version": VERSION, "revision_ok": "", "notas_revision": "",
                 "_lineas": set(lineas), "_carpetas": carpetas_linea(foto),
-            })
+            }
+            guardar(clave, 1 if faltan else 2, fila,
+                    {"modelo": modelo, "file_id": file_id, "ficha": ficha, "fuera_de_lista": fuera,
+                     "fin": fin_resp})
+
+    filas = [f for _, f, _ in mejor.values() if f is not None]
+    crudo = [c for _, _, c in mejor.values()]
+    errores = Counter(m for (m, _), (p, _, _) in mejor.items() if p == 0)
+    fines = Counter((f["modelo"], f["fin"]) for f in filas if f["incompleta"])
 
     filas.sort(key=lambda f: (f["carpetas"], f["nombre"], f["modelo"]))
     with RESULTADOS_CSV.open("w", newline="", encoding="utf-8-sig") as fh:
@@ -631,8 +668,11 @@ def cmd_recoger(_args):
         n_mod = sum(1 for f in filas if f["modelo"] == modelo)
         print(f"  {modelo:22s} fichas {n_mod}   coste real ≈ {coste_modelo[modelo]:.3f} $   errores: {errores[modelo]}   "
               f"incompletas: {inc_n}   con valores fuera de lista: {fuera_n}")
-        if modelo in motivos:
+        if modelo in motivos and errores[modelo]:
             print(f"      primer error: {motivos[modelo]}")
+        cortes = {fin: n for (m, fin), n in fines.items() if m == modelo}
+        if cortes:
+            print(f"      motivo de fin en las incompletas: {cortes}")
 
     if INCLUIR_RUTA:
         print("\nMarca detectada frente al cliente de la carpeta:")
@@ -689,7 +729,7 @@ def cmd_todo(args):
     if not MANIFEST.exists():
         cmd_listar(args)
     lotes = leer_json(LOTES, {}) or {}
-    if args.forzar or any(m not in lotes for m in modelos_activos(args)):
+    if args.forzar or args.solo_incompletas or any(m not in lotes for m in modelos_activos(args)):
         cmd_enviar(args)
     cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
     while True:
@@ -706,6 +746,8 @@ def main():
     p.add_argument("--si", action="store_true", help="no pedir confirmación antes de enviar")
     p.add_argument("--forzar", action="store_true", help="sustituir el lote de los modelos indicados")
     p.add_argument("--modelos", help="modelos a enviar, separados por comas (por defecto, MODELOS)")
+    p.add_argument("--solo-incompletas", action="store_true",
+                   help="con enviar/todo: repite solo las fotos con ficha incompleta o error y las fusiona")
     args = p.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
     {"listar": cmd_listar, "enviar": cmd_enviar, "estado": cmd_estado,

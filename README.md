@@ -46,6 +46,7 @@ python etiquetar.py recoger
 python etiquetar.py listar            # rehace el listado (agrupa fotos repetidas)
 python etiquetar.py todo --forzar     # vuelve a enviar todos los modelos
 python etiquetar.py enviar --modelos claude-sonnet-5-5 --forzar   # o solo uno
+python etiquetar.py todo --solo-incompletas   # repite solo fichas incompletas o con error y las fusiona
 ```
 
 ### Otra tanda en una carpeta distinta (p. ej. el archivo de 2025)
