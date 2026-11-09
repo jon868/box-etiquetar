@@ -16,6 +16,9 @@ PASSWORD = os.getenv("DESCARGA_PASSWORD", "")
 PUERTO = int(os.getenv("PORT", "8080"))
 
 TIPOS = {"resultados.csv": "text/csv; charset=utf-8",
+         "flota_campanas.csv": "text/csv; charset=utf-8",
+         "resultados_flota.csv": "text/csv; charset=utf-8",
+         "log.txt": "text/plain; charset=utf-8",
          "resultados.jsonl": "application/x-ndjson; charset=utf-8"}
 
 

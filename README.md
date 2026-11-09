@@ -60,6 +60,29 @@ python etiquetar.py todo
 El `export` solo dura mientras la consola está abierta: si vuelves más tarde, repítelo antes de
 `estado` o `recoger`. Si hay muchas fotos, el script las reparte solo en varios lotes.
 
+### Archivo completo, en segundo plano
+```bash
+export BOX_FOLDER_ID=6895313990 INCLUIR_RUTA=true MAX_FOTOS=100000 \
+       MODELOS=claude-haiku-5-5 DATA_DIR=/app/datos/archivo
+python etiquetar.py listar                    # cuenta fotos, coste y disco necesario
+df -h /app/datos                              # comprueba que hay sitio para las miniaturas
+mkdir -p /app/datos/archivo
+nohup python etiquetar.py todo --si > /app/datos/archivo/log.txt 2>&1 &
+tail -f /app/datos/archivo/log.txt            # Ctrl+C deja de mirar; el proceso sigue
+```
+- Sigue funcionando aunque cierres la consola, pero **no redespliegues** el servicio mientras corre.
+- Si se corta, relanza la misma línea de `nohup`: reanuda y solo envía lo que falta.
+- El log también se ve en `https://<tu-dominio>/archivo/log.txt`.
+
+### Vehículo de la flota por campaña (Sonnet)
+Con el mismo `export` de la tanda:
+```bash
+python etiquetar.py flota           # 3 fotos por campaña, pide confirmación, espera y recoge
+python etiquetar.py flota-recoger   # si cerraste antes de que terminara
+```
+Genera `flota_campanas.csv` (una fila por campaña, con columnas para confirmar) y
+`resultados_flota.csv` (cada foto con el vehículo de su campaña).
+
 ## 4. Descargar los resultados
 Abre `https://<tu-dominio>/` con el usuario y la contraseña de descarga y baja `resultados.csv` (o `2025/resultados.csv` para esa tanda)
 (una fila por foto y modelo, con enlace a Box y columnas vacías `revision_ok` y `notas_revision`).

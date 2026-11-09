@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 4
+Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 5
 alegria-activity
 
 Uso:
@@ -10,7 +10,9 @@ Uso:
          [--modelos m1,m2] [--forzar]        (solo esos modelos / sustituir lotes existentes)
   python etiquetar.py estado                 Muestra el estado de los lotes
   python etiquetar.py recoger                Descarga resultados y genera datos/resultados.csv
-  python etiquetar.py todo [--si]            Todo seguido, esperando a que terminen los lotes
+  python etiquetar.py todo [--si]            Todo seguido, esperando a que terminen los lotes (reanuda si se cortó)
+  python etiquetar.py flota [--si]           Vehículo de la flota por campaña con Sonnet (3 fotos por campaña)
+  python etiquetar.py flota-recoger          Recoge esa consulta: flota_campanas.csv y resultados_flota.csv
 
 Solo LEE de Box. No escribe, mueve ni borra nada allí.
 """
@@ -40,7 +42,7 @@ except ImportError:
 
 load_dotenv()
 
-VERSION = "v4"
+VERSION = "v5"
 
 # ---------------------------------------------------------------- configuración
 API = "https://api.box.com/2.0"
@@ -69,6 +71,10 @@ LOTES = DATA / "lotes.json"
 CACHE = DATA / "miniaturas"
 RESULTADOS_CSV = DATA / "resultados.csv"
 RESULTADOS_JSONL = DATA / "resultados.jsonl"
+ENVIADAS = DATA / "enviadas.json"          # qué fotos van ya en algún lote, por modelo (para reanudar)
+LOTES_FLOTA = DATA / "lotes_flota.json"
+FLOTA_CSV = DATA / "flota_campanas.csv"
+MODELO_FLOTA = os.getenv("MODELO_FLOTA", "claude-sonnet-5-5")
 
 EXTENSIONES = {"jpg", "jpeg", "png", "webp", "heic", "heif", "tif", "tiff"}
 
@@ -318,6 +324,24 @@ def rutas(foto):
     return foto.get("rutas") or [foto.get("ruta", "")]
 
 
+def es_anio(t):
+    return len(t) == 4 and t.isdigit()
+
+
+def campana_de(ruta):
+    """'2025/ISDIN/x' -> '2025/ISDIN'; 'ISDIN/x' -> 'ISDIN'; '' -> '(raíz)'."""
+    partes = [x for x in (ruta or "").split("/") if x]
+    if not partes:
+        return "(raíz)"
+    if es_anio(partes[0]) and len(partes) > 1:
+        return f"{partes[0]}/{partes[1]}"
+    return partes[0]
+
+
+def cliente_de(ruta):
+    return campana_de(ruta).split("/")[-1]
+
+
 def carpetas_linea(foto):
     return {r.split("/")[0] for r in rutas(foto)} & set(LINEAS)
 
@@ -376,10 +400,11 @@ def marca_en_carpeta(marca, foto):
     if len(m) < 3:
         return None
     for r in rutas(foto):
-        c = normal(r.split("/")[0]) if r else ""
-        if len(c) >= 3:
+        nombre = cliente_de(r) if r else ""
+        c = normal(nombre)
+        if len(c) >= 3 and nombre != "(raíz)":
             return m in c or c in m or any(len(p) >= 4 and p in m for p in
-                                          [normal(x) for x in r.split("/")[0].replace("_", " ").split()])
+                                          [normal(x) for x in nombre.replace("_", " ").split()])
     return None
 
 
@@ -404,8 +429,10 @@ def cmd_listar(_args):
     escribir_json(MANIFEST, fotos)
     print(f"Archivos de imagen: {len(archivos)} · fotos distintas: {total} "
           f"({len(archivos) - total} repetidas en varias carpetas)")
-    print(f"En el piloto: {len(fotos)} (MAX_FOTOS={MAX_FOTOS}) · "
+    print(f"En esta tanda: {len(fotos)} (MAX_FOTOS={MAX_FOTOS}) · "
           f"tamaño original {sum(f['tamano'] for f in fotos) / 1e9:.2f} GB")
+    print(f"Coste orientativo con Haiku: ≈ {len(fotos) * 0.00045:.2f} $ · disco para miniaturas: "
+          f"≈ {len(fotos) * 0.25 / 1024:.1f} GB · campañas: {len({campana_de(r) for f in fotos for r in rutas(f)})}")
     for carpeta, n in Counter((r.split("/")[0] or "(raíz)") for f in fotos for r in rutas(f)).most_common():
         print(f"  {n:4d}  {carpeta}")
 
@@ -423,10 +450,22 @@ def cmd_enviar(args):
         print(f"Repitiendo {len(fotos)} fotos incompletas o con error (se fusionan con las buenas al recoger).")
         if not fotos:
             sys.exit("No hay fotos que repetir.")
-    repetidos = [m for m in modelos if m in lotes]
-    if repetidos and not args.forzar and not solo:
-        sys.exit(f"Ya hay lote para {', '.join(repetidos)}. Usa --forzar para sustituirlo "
-                 f"(o --modelos para enviar solo otros).")
+    enviadas = {m: set(v) for m, v in (leer_json(ENVIADAS, {}) or {}).items()}
+    for m in modelos:
+        if args.forzar:
+            enviadas[m] = set()
+            lotes[m] = []
+        elif m in lotes and m not in enviadas:   # tandas de versiones anteriores, sin registro: todo enviado
+            enviadas[m] = {f["id"] for f in fotos}
+    if not solo:
+        pendientes = {m: {f["id"] for f in fotos} - enviadas.get(m, set()) for m in modelos}
+        quedan = set().union(*pendientes.values()) if pendientes else set()
+        ya = len(fotos) - len(quedan)
+        if ya:
+            print(f"Reanudando: {ya} fotos ya estaban en lotes enviados; quedan {len(quedan)}.")
+        fotos = [f for f in fotos if f["id"] in quedan]
+        if not fotos:
+            sys.exit("No queda nada por enviar (usa --forzar para empezar de cero).")
 
     refs, tokens_refs = bloques_referencia() if USAR_REFERENCIAS else ([], 0)
     bytes_refs = len(json.dumps(refs))
@@ -488,8 +527,11 @@ def cmd_enviar(args):
     # 3) enviar lote a lote, construyendo las peticiones solo de ese lote
     cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
     for modelo in modelos:
-        lotes[modelo] = ids_lote(lotes[modelo]) if (solo and modelo in lotes) else []
-        for k, grupo in enumerate(grupos, 1):
+        lotes[modelo] = ids_lote(lotes[modelo]) if modelo in lotes else []
+        hechas_m = enviadas.setdefault(modelo, set())
+        grupos_m = [[f for f in g if solo or f["id"] not in hechas_m] for g in grupos]
+        grupos_m = [g for g in grupos_m if g]
+        for k, grupo in enumerate(grupos_m, 1):
             peticiones = []
             for foto in grupo:
                 texto = f"Archivo: {foto['nombre']}"
@@ -512,7 +554,9 @@ def cmd_enviar(args):
             lote = cliente.messages.batches.create(requests=peticiones)
             lotes[modelo].append(lote.id)
             escribir_json(LOTES, lotes)
-            print(f"Lote {k}/{len(grupos)} enviado para {modelo}: {lote.id} ({len(peticiones)} fotos)")
+            hechas_m.update(f["id"] for f in grupo)
+            escribir_json(ENVIADAS, {m: sorted(v) for m, v in enviadas.items()})
+            print(f"Lote {k}/{len(grupos_m)} enviado para {modelo}: {lote.id} ({len(peticiones)} fotos)")
             del peticiones
     print("Los lotes suelen tardar de minutos a unas horas (máximo 24 h). Consulta con: python etiquetar.py estado")
 
@@ -576,7 +620,7 @@ def cmd_recoger(_args):
     if any(b.processing_status != "ended" for b in st.values()):
         sys.exit("Todavía hay lotes en curso. Vuelve a probar más tarde.")
 
-    campos = ["file_id", "nombre", "carpetas", "cliente_carpeta", "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
+    campos = ["file_id", "nombre", "carpetas", "campana", "cliente_carpeta", "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
               "linea_principal", "lineas_servicio", "marca_visible", "fuente_marca", "personas",
               "posibles_menores", "calidad", "apta_propuesta", "descripcion", "palabras_clave", "confianza",
               "fuera_de_lista", "incompleta", "fin", "marca_en_carpeta", "uso_autorizado", "coste_usd", "version", "revision_ok", "notas_revision"]
@@ -627,7 +671,8 @@ def cmd_recoger(_args):
             fila = {
                 "file_id": file_id, "nombre": foto["nombre"],
                 "carpetas": " | ".join(x or "(raíz)" for x in rutas(foto)),
-                "cliente_carpeta": primera.split("/")[0] if INCLUIR_RUTA else "",
+                "cliente_carpeta": cliente_de(primera) if INCLUIR_RUTA else "",
+                "campana": campana_de(primera),
                 "enlace_box": f"https://app.box.com/file/{file_id}", "modelo": modelo,
                 **{k: ficha.get(k, "") for k in PROPS},
                 "linea_principal": lineas[0] if lineas else "",
@@ -725,12 +770,181 @@ def cmd_recoger(_args):
         print(f"\nFotos marcadas con posibles menores ({len(menores)}): revisar antes de usarlas en material comercial.")
 
 
+# ---------------------------------------------------------------- flota por campaña (Sonnet)
+FOTOS_POR_CAMPANA = int(os.getenv("FOTOS_POR_CAMPANA", "3"))
+
+SYSTEM_FLOTA = f"""Eres el responsable de flota de alegria-activity. Tienes las fotos de referencia de los \
+vehículos propios de la agencia ({", ".join(FLOTA)}; de Cotazero no hay foto) y varias fotos de UNA campaña. \
+En una campaña se suele usar un mismo vehículo. Di qué vehículo o vehículos de la flota aparecen en las fotos de \
+la campaña, comparando forma, proporciones, número de ejes, cabina, partes expandibles y estructura con las \
+referencias. La rotulación cambia en cada campaña: no te fíes de colores ni logotipos. Muchas campañas usan \
+unidades fabricadas para el cliente o vehículos alquilados que NO son de la flota: en ese caso marca \
+ninguno_de_la_flota = true. Si no estás seguro, confianza "baja". Llama directamente a la herramienta \
+guardar_vehiculo, sin escribir texto antes."""
+
+HERRAMIENTA_FLOTA = {
+    "name": "guardar_vehiculo",
+    "description": "Guarda qué vehículo(s) de la flota se usan en la campaña.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "vehiculos": {"type": "array", "maxItems": 3, "items": {"type": "string", "enum": FLOTA}},
+            "ninguno_de_la_flota": {"type": "boolean"},
+            "confianza": {"type": "string", "enum": ["alta", "media", "baja"]},
+            "explicacion": {"type": "string", "description": "1-2 frases: en qué rasgos te basas."},
+        },
+        "required": ["vehiculos", "ninguno_de_la_flota", "confianza", "explicacion"],
+    },
+}
+
+
+def leer_resultados():
+    if not RESULTADOS_CSV.exists():
+        sys.exit("No hay resultados.csv: ejecuta antes 'recoger'.")
+    with RESULTADOS_CSV.open(encoding="utf-8-sig") as fh:
+        return list(csv.DictReader(fh))
+
+
+def elegir_fotos_campana(filas):
+    def orden(f):
+        return ({"alta": 0, "media": 1}.get(f.get("calidad"), 2), f.get("apta_propuesta") != "True",
+                {"alta": 0, "media": 1}.get(f.get("confianza"), 2))
+    exteriores = sorted((f for f in filas if f.get("plano") == "exterior del vehículo"), key=orden)
+    if exteriores:
+        return exteriores[:FOTOS_POR_CAMPANA]
+    interiores = sorted((f for f in filas if f.get("plano") == "interior del vehículo"), key=orden)
+    return interiores[:2]
+
+
+def cmd_flota(args):
+    if not (LOTES_FLOTA.exists() and not args.forzar):
+        filas = [f for f in leer_resultados() if not f.get("modelo") or f["modelo"] == MODELOS[0]]
+        por_campana = {}
+        for f in filas:
+            por_campana.setdefault(f.get("campana") or campana_de(f["carpetas"].split(" | ")[0]), []).append(f)
+        elegidas = {c: elegir_fotos_campana(fs) for c, fs in por_campana.items()}
+        sin = sorted(c for c, fs in elegidas.items() if not fs)
+        elegidas = {c: fs for c, fs in elegidas.items() if fs}
+        print(f"Campañas: {len(por_campana)} · con fotos de vehículo: {len(elegidas)} · sin ninguna: {len(sin)}")
+        if not elegidas:
+            sys.exit("Ninguna campaña tiene fotos de vehículo.")
+        refs, _ = bloques_referencia()
+        pin, pout = precio(MODELO_FLOTA)
+        estimado = len(elegidas) * ((2500 + FOTOS_POR_CAMPANA * 1400 + 1000) * pin + 400 * pout) / 1e6
+        print(f"Coste estimado con {MODELO_FLOTA} (Batch): ≈ {estimado:.2f} $")
+        if not args.si and input("¿Enviar? [s/N] ").strip().lower() not in ("s", "si", "sí"):
+            sys.exit("Cancelado. No se ha enviado nada.")
+        cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
+        estado = {"lotes": [], "campanas": {}}
+        claves = sorted(elegidas)
+        tam = max(1, int(MAX_MB_LOTE * 1024 * 1024 / (len(json.dumps(refs)) + FOTOS_POR_CAMPANA * 450_000)))
+        for k in range(0, len(claves), tam):
+            peticiones = []
+            for j, camp in enumerate(claves[k:k + tam], start=k):
+                contenido = refs + [{"type": "text", "text": f"CAMPAÑA: {camp} · {len(por_campana[camp])} fotos en total"}]
+                for f in elegidas[camp]:
+                    contenido += [bloque_imagen(miniatura(f["file_id"])),
+                                  {"type": "text", "text": f"Descripción automática: {f.get('descripcion', '')}"}]
+                cid = f"c{j}"
+                estado["campanas"][cid] = {"campana": camp, "n_fotos": len(por_campana[camp]),
+                                           "fotos": [f["file_id"] for f in elegidas[camp]]}
+                peticiones.append({"custom_id": cid, "params": {
+                    "model": MODELO_FLOTA, "max_tokens": 1500,
+                    "system": [{"type": "text", "text": SYSTEM_FLOTA, "cache_control": {"type": "ephemeral"}}],
+                    "tools": [HERRAMIENTA_FLOTA], "tool_choice": {"type": "auto"},
+                    "messages": [{"role": "user", "content": contenido}]}})
+            lote = cliente.messages.batches.create(requests=peticiones)
+            estado["lotes"].append(lote.id)
+            escribir_json(LOTES_FLOTA, estado)
+            print(f"Lote de flota enviado: {lote.id} ({len(peticiones)} campañas)")
+        if sin:
+            print("Sin fotos de vehículo (no se consultan): " + ", ".join(sin[:20]) + (" …" if len(sin) > 20 else ""))
+    cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
+    while True:
+        estado = leer_json(LOTES_FLOTA)
+        lotes = [cliente.messages.batches.retrieve(i) for i in estado["lotes"]]
+        print(time.strftime("%H:%M:%S"), "flota:", ", ".join(f"{b.processing_status}" for b in lotes))
+        if all(b.processing_status == "ended" for b in lotes) or getattr(args, "sin_esperar", False):
+            break
+        time.sleep(60)
+    cmd_flota_recoger(args)
+
+
+def cmd_flota_recoger(_args):
+    estado = leer_json(LOTES_FLOTA)
+    if not estado:
+        sys.exit("No hay consulta de flota enviada: ejecuta 'flota'.")
+    cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
+    lotes = [cliente.messages.batches.retrieve(i) for i in estado["lotes"]]
+    if any(b.processing_status != "ended" for b in lotes):
+        sys.exit("La consulta de flota sigue en curso. Vuelve a probar más tarde.")
+    pin, pout = precio(MODELO_FLOTA)
+    filas, coste = [], 0.0
+    for lote_id in estado["lotes"]:
+        for r in cliente.messages.batches.results(lote_id):
+            info = estado["campanas"].get(r.custom_id, {})
+            fila = {"campana": info.get("campana", r.custom_id), "n_fotos": info.get("n_fotos", ""),
+                    "fotos_usadas": " ".join(f"https://app.box.com/file/{x}" for x in info.get("fotos", [])),
+                    "vehiculos": "", "ninguno_de_la_flota": "", "confianza": "", "explicacion": "",
+                    "confirmado": "", "vehiculo_correcto": ""}
+            if r.result.type == "succeeded":
+                msg = r.result.message
+                u = msg.usage
+                coste += ((u.input_tokens + (u.cache_creation_input_tokens or 0) * 1.25
+                           + (u.cache_read_input_tokens or 0) * 0.1) * pin + u.output_tokens * pout) / 1e6
+                d = next((b.input for b in msg.content if b.type == "tool_use"), None)
+                if d is None:
+                    texto = "".join(getattr(b, "text", "") for b in msg.content)
+                    try:
+                        d = json.loads(texto[texto.index("{"): texto.rindex("}") + 1])
+                    except ValueError:
+                        d = {"explicacion": "ERROR: respuesta sin ficha"}
+                validos = [v for v in (d.get("vehiculos") or []) if v in FLOTA]
+                fila.update(vehiculos=", ".join(validos),
+                            ninguno_de_la_flota="sí" if d.get("ninguno_de_la_flota") else "no",
+                            confianza=d.get("confianza", ""), explicacion=d.get("explicacion", ""))
+            else:
+                fila["explicacion"] = f"ERROR: {r.result.type}"
+            filas.append(fila)
+    filas.sort(key=lambda f: f["campana"])
+    with FLOTA_CSV.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(filas[0]))
+        w.writeheader()
+        w.writerows(filas)
+    # añadir el vehículo de la campaña a cada foto
+    por_campana = {f["campana"]: f for f in filas}
+    res = leer_resultados()
+    salida = DATA / "resultados_flota.csv"
+    with salida.open("w", newline="", encoding="utf-8-sig") as fh:
+        campos = list(res[0]) + ["vehiculo_campana", "confianza_vehiculo_campana"]
+        w = csv.DictWriter(fh, fieldnames=campos)
+        w.writeheader()
+        for f in res:
+            c = por_campana.get(f.get("campana") or campana_de(f["carpetas"].split(" | ")[0]), {})
+            veh = c.get("vehiculos") or ("ninguno de la flota" if c.get("ninguno_de_la_flota") == "sí" else "")
+            w.writerow({**f, "vehiculo_campana": veh, "confianza_vehiculo_campana": c.get("confianza", "")})
+    cuenta = Counter(v.strip() for f in filas for v in (f["vehiculos"] or "").split(",") if v.strip())
+    print(f"\nFlota por campaña: {FLOTA_CSV} ({len(filas)} campañas, coste ≈ {coste:.2f} $)")
+    print("  " + ", ".join(f"{k} {n}" for k, n in cuenta.most_common()) +
+          f" · ninguno de la flota: {sum(f['ninguno_de_la_flota'] == 'sí' for f in filas)}")
+    print(f"Fotos con el vehículo de su campaña: {salida}")
+
+
 def cmd_todo(args):
     if not MANIFEST.exists():
         cmd_listar(args)
     lotes = leer_json(LOTES, {}) or {}
-    if args.forzar or args.solo_incompletas or any(m not in lotes for m in modelos_activos(args)):
-        cmd_enviar(args)
+    fotos = leer_json(MANIFEST) or []
+    enviadas = leer_json(ENVIADAS, {}) or {}
+    falta = any(m not in lotes or (m in enviadas and len(enviadas[m]) < len(fotos))
+                for m in modelos_activos(args))
+    if args.forzar or args.solo_incompletas or falta:
+        try:
+            cmd_enviar(args)
+        except SystemExit as e:
+            if not leer_json(LOTES):
+                raise
+            print(e, "· sigo con los lotes ya enviados.")
     cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
     while True:
         print(time.strftime("%H:%M:%S"), "estado de los lotes:")
@@ -742,7 +956,7 @@ def cmd_todo(args):
 
 def main():
     p = argparse.ArgumentParser(description="Piloto de etiquetado de fotos de Box con Claude")
-    p.add_argument("comando", choices=["listar", "enviar", "estado", "recoger", "todo"])
+    p.add_argument("comando", choices=["listar", "enviar", "estado", "recoger", "todo", "flota", "flota-recoger"])
     p.add_argument("--si", action="store_true", help="no pedir confirmación antes de enviar")
     p.add_argument("--forzar", action="store_true", help="sustituir el lote de los modelos indicados")
     p.add_argument("--modelos", help="modelos a enviar, separados por comas (por defecto, MODELOS)")
@@ -750,8 +964,8 @@ def main():
                    help="con enviar/todo: repite solo las fotos con ficha incompleta o error y las fusiona")
     args = p.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
-    {"listar": cmd_listar, "enviar": cmd_enviar, "estado": cmd_estado,
-     "recoger": cmd_recoger, "todo": cmd_todo}[args.comando](args)
+    {"listar": cmd_listar, "enviar": cmd_enviar, "estado": cmd_estado, "recoger": cmd_recoger,
+     "todo": cmd_todo, "flota": cmd_flota, "flota-recoger": cmd_flota_recoger}[args.comando](args)
 
 
 if __name__ == "__main__":
