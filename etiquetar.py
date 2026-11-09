@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 2
+Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 3
 alegria-activity
 
 Uso:
@@ -23,6 +23,7 @@ import os
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import anthropic
@@ -39,7 +40,7 @@ except ImportError:
 
 load_dotenv()
 
-VERSION = "v2"
+VERSION = "v3"
 
 # ---------------------------------------------------------------- configuración
 API = "https://api.box.com/2.0"
@@ -51,6 +52,9 @@ LADO = int(os.getenv("LADO_MAX_PX", "1024"))
 LADO_REF = int(os.getenv("LADO_REF_PX", "512"))
 INCLUIR_RUTA = os.getenv("INCLUIR_RUTA", "false").lower() == "true"
 USAR_REFERENCIAS = os.getenv("USAR_REFERENCIAS", "true").lower() == "true"
+HILOS = int(os.getenv("HILOS", "6"))                       # descargas de miniaturas en paralelo
+MAX_MB_LOTE = int(os.getenv("MAX_MB_LOTE", "180"))         # la Batch API admite hasta 256 MB por lote
+MAX_PETICIONES_LOTE = int(os.getenv("MAX_PETICIONES_LOTE", "5000"))
 
 # Precios Batch en USD por millón de tokens (entrada, salida). Orientativos: revísalos en la Console.
 PRECIOS_BATCH = {
@@ -110,9 +114,9 @@ lista, sin inventar otros. Reglas:
 uno (salvo Cotazero). Elige uno de la flota solo si coincide claramente con su referencia en forma y estructura \
 (la rotulación cambia en cada campaña, no te fíes de los colores). Muchas fotos son de unidades fabricadas para \
 clientes, que NO son de la flota: en ese caso usa "otro vehículo". Si no hay vehículo, "sin vehículo".
-3. Marca: el nombre corto de la marca o cliente principal que se lee en la imagen (p. ej. "Repsol", \
-"Fundación DISA"), sin frases. Vacío si no hay ninguna. Si la sacas del nombre del archivo y no de la imagen, \
-fuente_marca = "nombre de archivo".
+3. Marca: el nombre corto de la marca o cliente principal (p. ej. "Repsol", "Fundación DISA"), sin frases. \
+Prioridad: lo que se lee en la imagen; si no se lee nada, el nombre de la carpeta (si te la doy, suele ser el \
+cliente); si no, el nombre del archivo. Indica de dónde la sacas en fuente_marca. Vacío si no hay ninguna.
 4. Personas: NO identifiques a nadie ni describas rasgos físicos de personas concretas. Indica solo cuántas hay \
 y qué están haciendo.
 5. posibles_menores: "sí" si aparecen niños o adolescentes; "dudoso" si no se puede descartar; "no" en otro caso.
@@ -141,7 +145,7 @@ HERRAMIENTA = {
             "lineas_servicio": {"type": "array", "minItems": 1, "maxItems": 3,
                                 "items": {"type": "string", "enum": LINEAS}},
             "marca_visible": {"type": "string", "description": "Nombre corto de la marca; vacío si ninguna."},
-            "fuente_marca": {"type": "string", "enum": ["imagen", "nombre de archivo", "ninguna"]},
+            "fuente_marca": {"type": "string", "enum": ["imagen", "carpeta", "nombre de archivo", "ninguna"]},
             "personas": {"type": "string", "enum": ["ninguna", "1-3", "4-15", "más de 15"]},
             "posibles_menores": {"type": "string", "enum": ["sí", "no", "dudoso"]},
             "calidad": {"type": "string", "enum": ["alta", "media", "baja"]},
@@ -350,6 +354,35 @@ def modelos_activos(args):
     return MODELOS
 
 
+def ids_lote(valor):
+    """lotes.json guarda una lista de lotes por modelo (versiones antiguas: un solo id)."""
+    return valor if isinstance(valor, list) else [valor]
+
+
+def incompleta(ficha):
+    return [c for c in HERRAMIENTA["input_schema"]["required"]
+            if ficha.get(c) in (None, "", []) and c not in ("marca_visible",)]
+
+
+def normal(texto):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode().lower()
+    return "".join(ch for ch in t if ch.isalnum())
+
+
+def marca_en_carpeta(marca, foto):
+    """¿La marca detectada aparece en el nombre de la carpeta de cliente (o al revés)?"""
+    m = normal(marca)
+    if len(m) < 3:
+        return None
+    for r in rutas(foto):
+        c = normal(r.split("/")[0]) if r else ""
+        if len(c) >= 3:
+            return m in c or c in m or any(len(p) >= 4 and p in m for p in
+                                          [normal(x) for x in r.split("/")[0].replace("_", " ").split()])
+    return None
+
+
 # ---------------------------------------------------------------- comandos
 def cmd_listar(_args):
     raiz = box_get(f"{API}/folders/{CARPETA_RAIZ}", params={"fields": "name"})
@@ -389,34 +422,52 @@ def cmd_enviar(args):
                  f"(o --modelos para enviar solo otros).")
 
     refs, tokens_refs = bloques_referencia() if USAR_REFERENCIAS else ([], 0)
+    bytes_refs = len(json.dumps(refs))
     if refs:
         print(f"Referencias de flota: {(len(refs) - 1) // 2} fotos (~{tokens_refs} tokens, en caché)")
 
-    print(f"Preparando {len(fotos)} miniaturas (se guardan en {CACHE}/)...")
-    peticiones_base, tokens_img, fallos = [], 0, []
-    for i, foto in enumerate(fotos, 1):
+    # 1) miniaturas en paralelo (quedan en caché en disco; no se guardan en memoria)
+    print(f"Preparando {len(fotos)} miniaturas con {HILOS} descargas a la vez (caché en {CACHE}/)...")
+    hechas = {"n": 0}
+
+    def preparar(foto):
         try:
             jpg = miniatura(foto["id"])
+            res = (foto, tokens_imagen(jpg), len(jpg), None)
         except Exception as e:  # noqa: BLE001
-            fallos.append((foto["nombre"], str(e)[:120]))
-            continue
-        tokens_img += tokens_imagen(jpg)
-        texto = f"Archivo: {foto['nombre']}"
-        if INCLUIR_RUTA and any(rutas(foto)):
-            texto += "\nCarpeta: " + " | ".join(r for r in rutas(foto) if r)
-        contenido = refs + [{"type": "text", "text": "FOTO A CATALOGAR:"}, bloque_imagen(jpg),
-                            {"type": "text", "text": texto}]
-        peticiones_base.append((foto["id"], contenido))
-        if i % 25 == 0:
-            print(f"  {i}/{len(fotos)}")
-    for nombre, err in fallos:
-        print(f"  ⚠ no se pudo preparar {nombre}: {err}")
-    if not peticiones_base:
+            res = (foto, 0, 0, str(e)[:120])
+        hechas["n"] += 1
+        if hechas["n"] % 50 == 0:
+            print(f"  {hechas['n']}/{len(fotos)}")
+        return res
+
+    with ThreadPoolExecutor(max_workers=HILOS) as ex:
+        preparadas = list(ex.map(preparar, fotos))
+    validas = [(f, t, b) for f, t, b, err in preparadas if err is None]
+    for f, _, _, err in preparadas:
+        if err:
+            print(f"  ⚠ no se pudo preparar {f['nombre']}: {err}")
+    if not validas:
         sys.exit("No se ha podido preparar ninguna imagen.")
 
-    n = len(peticiones_base)
+    # 2) repartir en lotes por tamaño
+    limite = MAX_MB_LOTE * 1024 * 1024
+    grupos, actual, peso = [], [], 0
+    for f, t, b in validas:
+        p = bytes_refs + int(b * 1.37) + 8000
+        if actual and (peso + p > limite or len(actual) >= MAX_PETICIONES_LOTE):
+            grupos.append(actual)
+            actual, peso = [], 0
+        actual.append(f)
+        peso += p
+    if actual:
+        grupos.append(actual)
+
+    n = len(validas)
+    tokens_img = sum(t for _, t, _ in validas)
     tokens_fijos = 2200  # instrucciones + esquema, aprox.
-    print("\nCoste estimado (precios Batch orientativos; referencias contadas al 30 % por la caché):")
+    print(f"\n{n} fotos en {len(grupos)} lote(s) por modelo.")
+    print("Coste estimado (precios Batch orientativos; referencias contadas al 30 % por la caché):")
     total = 0.0
     for modelo in modelos:
         pin, pout = precio(modelo)
@@ -427,35 +478,58 @@ def cmd_enviar(args):
     if not args.si and input("\n¿Enviar los lotes? [s/N] ").strip().lower() not in ("s", "si", "sí"):
         sys.exit("Cancelado. No se ha enviado nada.")
 
+    # 3) enviar lote a lote, construyendo las peticiones solo de ese lote
     cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
     for modelo in modelos:
-        # tool_choice "auto": algunos modelos (p. ej. Sonnet 5.5) no aceptan forzar la herramienta.
-        peticiones = [{
-            "custom_id": f"f_{file_id}",
-            "params": {
-                "model": modelo,
-                "max_tokens": 1500,
-                "system": [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
-                "tools": [HERRAMIENTA],
-                "tool_choice": {"type": "auto"},
-                "messages": [{"role": "user", "content": contenido}],
-            },
-        } for file_id, contenido in peticiones_base]
-        lote = cliente.messages.batches.create(requests=peticiones)
-        lotes[modelo] = lote.id
-        escribir_json(LOTES, lotes)
-        print(f"Lote enviado para {modelo}: {lote.id}")
+        lotes[modelo] = []
+        for k, grupo in enumerate(grupos, 1):
+            peticiones = []
+            for foto in grupo:
+                texto = f"Archivo: {foto['nombre']}"
+                if INCLUIR_RUTA and any(rutas(foto)):
+                    texto += "\nCarpeta: " + " | ".join(r for r in rutas(foto) if r)
+                contenido = refs + [{"type": "text", "text": "FOTO A CATALOGAR:"},
+                                    bloque_imagen(miniatura(foto["id"])), {"type": "text", "text": texto}]
+                # tool_choice "auto": algunos modelos (p. ej. Sonnet 5.5) no aceptan forzar la herramienta.
+                peticiones.append({
+                    "custom_id": f"f_{foto['id']}",
+                    "params": {
+                        "model": modelo,
+                        "max_tokens": 1500,
+                        "system": [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+                        "tools": [HERRAMIENTA],
+                        "tool_choice": {"type": "auto"},
+                        "messages": [{"role": "user", "content": contenido}],
+                    },
+                })
+            lote = cliente.messages.batches.create(requests=peticiones)
+            lotes[modelo].append(lote.id)
+            escribir_json(LOTES, lotes)
+            print(f"Lote {k}/{len(grupos)} enviado para {modelo}: {lote.id} ({len(peticiones)} fotos)")
+            del peticiones
     print("Los lotes suelen tardar de minutos a unas horas (máximo 24 h). Consulta con: python etiquetar.py estado")
+
+
+class EstadoModelo:
+    def __init__(self, procesando, ok, error, curso, caducadas):
+        self.processing_status = procesando
+        self.ok, self.error, self.curso, self.caducadas = ok, error, curso, caducadas
 
 
 def estados(cliente, lotes):
     res = {}
-    for modelo, lote_id in lotes.items():
-        b = cliente.messages.batches.retrieve(lote_id)
-        res[modelo] = b
-        c = b.request_counts
-        print(f"  {modelo:22s} {b.processing_status:12s} ok={c.succeeded} error={c.errored} "
-              f"en curso={c.processing} caducadas={c.expired}")
+    for modelo, valor in lotes.items():
+        ok = err = curso = cad = 0
+        terminado = True
+        for lote_id in ids_lote(valor):
+            b = cliente.messages.batches.retrieve(lote_id)
+            c = b.request_counts
+            ok, err, curso, cad = ok + c.succeeded, err + c.errored, curso + c.processing, cad + c.expired
+            terminado &= b.processing_status == "ended"
+        e = EstadoModelo("ended" if terminado else "in_progress", ok, err, curso, cad)
+        res[modelo] = e
+        print(f"  {modelo:22s} {e.processing_status:12s} ok={ok} error={err} en curso={curso} caducadas={cad} "
+              f"({len(ids_lote(valor))} lote/s)")
     return res
 
 
@@ -464,6 +538,11 @@ def cmd_estado(_args):
     if not lotes:
         sys.exit("No hay lotes enviados.")
     estados(anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY")), lotes)
+
+
+def resultados_de(cliente, valor):
+    for lote_id in ids_lote(valor):
+        yield from cliente.messages.batches.results(lote_id)
 
 
 def cmd_recoger(_args):
@@ -479,12 +558,12 @@ def cmd_recoger(_args):
     campos = ["file_id", "nombre", "carpetas", "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
               "linea_principal", "lineas_servicio", "marca_visible", "fuente_marca", "personas",
               "posibles_menores", "calidad", "apta_propuesta", "descripcion", "palabras_clave", "confianza",
-              "fuera_de_lista", "uso_autorizado", "coste_usd", "version", "revision_ok", "notas_revision"]
+              "fuera_de_lista", "incompleta", "marca_en_carpeta", "uso_autorizado", "coste_usd", "version", "revision_ok", "notas_revision"]
     filas, crudo = [], []
     coste_modelo, errores, motivos = Counter(), Counter(), {}
-    for modelo, lote_id in lotes.items():
+    for modelo, valor in lotes.items():
         pin, pout = precio(modelo)
-        for r in cliente.messages.batches.results(lote_id):
+        for r in resultados_de(cliente, valor):
             file_id = r.custom_id.split("_", 1)[1]
             foto = fotos.get(file_id, {"nombre": "?", "ruta": ""})
             if r.result.type != "succeeded":
@@ -510,6 +589,7 @@ def cmd_recoger(_args):
                     continue
             ficha = dict(ficha)
             fuera = normalizar(ficha)
+            faltan = incompleta(ficha)
             u = msg.usage
             tin = (u.input_tokens + (u.cache_creation_input_tokens or 0) * 1.25
                    + (u.cache_read_input_tokens or 0) * 0.1)
@@ -526,6 +606,9 @@ def cmd_recoger(_args):
                 "lineas_servicio": ", ".join(lineas),
                 "palabras_clave": ", ".join(ficha.get("palabras_clave", []) or []),
                 "fuera_de_lista": "; ".join(fuera),
+                "incompleta": ", ".join(faltan),
+                "marca_en_carpeta": {True: "sí", False: "no", None: ""}[marca_en_carpeta(ficha.get("marca_visible", ""), foto)]
+                if INCLUIR_RUTA else "",
                 "uso_autorizado": "publicada en web" if CARPETA_RAIZ == "379464633435" else "pendiente",
                 "coste_usd": f"{coste:.5f}", "version": VERSION, "revision_ok": "", "notas_revision": "",
                 "_lineas": set(lineas), "_carpetas": carpetas_linea(foto),
@@ -544,10 +627,21 @@ def cmd_recoger(_args):
     print(f"\nResultados {VERSION}: {RESULTADOS_CSV} ({len(filas)} filas)")
     for modelo in lotes:
         fuera_n = sum(1 for f in filas if f["modelo"] == modelo and f["fuera_de_lista"])
-        print(f"  {modelo:22s} coste real ≈ {coste_modelo[modelo]:.3f} $   errores: {errores[modelo]}   "
-              f"fichas con valores fuera de lista: {fuera_n}")
+        inc_n = sum(1 for f in filas if f["modelo"] == modelo and f["incompleta"])
+        n_mod = sum(1 for f in filas if f["modelo"] == modelo)
+        print(f"  {modelo:22s} fichas {n_mod}   coste real ≈ {coste_modelo[modelo]:.3f} $   errores: {errores[modelo]}   "
+              f"incompletas: {inc_n}   con valores fuera de lista: {fuera_n}")
         if modelo in motivos:
             print(f"      primer error: {motivos[modelo]}")
+
+    if INCLUIR_RUTA:
+        print("\nMarca detectada frente al cliente de la carpeta:")
+        for modelo in lotes:
+            c = Counter(f["marca_en_carpeta"] for f in filas if f["modelo"] == modelo)
+            ev = c["sí"] + c["no"]
+            if ev:
+                print(f"  {modelo:22s} coincide {c['sí']}/{ev} = {c['sí'] / ev:.0%}   "
+                      f"(sin marca o sin carpeta: {c['']})")
 
     print("\nLínea de servicio frente a la carpeta (fotos en carpetas con nombre de línea):")
     for modelo in lotes:

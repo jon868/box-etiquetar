@@ -15,10 +15,20 @@ USUARIO = os.getenv("DESCARGA_USUARIO", "alegria")
 PASSWORD = os.getenv("DESCARGA_PASSWORD", "")
 PUERTO = int(os.getenv("PORT", "8080"))
 
-ARCHIVOS = {
-    "/resultados.csv": ("resultados.csv", "text/csv; charset=utf-8"),
-    "/resultados.jsonl": ("resultados.jsonl", "application/x-ndjson; charset=utf-8"),
-}
+TIPOS = {"resultados.csv": "text/csv; charset=utf-8",
+         "resultados.jsonl": "application/x-ndjson; charset=utf-8"}
+
+
+def disponibles():
+    """resultados de datos/ y de sus subcarpetas (una por tanda: datos/2025/...)."""
+    salida = {}
+    for nombre, tipo in TIPOS.items():
+        if (DATA / nombre).exists():
+            salida[f"/{nombre}"] = (DATA / nombre, tipo)
+        for sub in sorted(p for p in DATA.iterdir() if p.is_dir()):
+            if (sub / nombre).exists() and sub.name.replace("-", "").replace("_", "").isalnum():
+                salida[f"/{sub.name}/{nombre}"] = (sub / nombre, tipo)
+    return salida
 
 
 class Manejador(BaseHTTPRequestHandler):
@@ -44,21 +54,17 @@ class Manejador(BaseHTTPRequestHandler):
             self.send_header("WWW-Authenticate", 'Basic realm="etiquetado-fotos"')
             self.end_headers()
             return
+        archivos = disponibles()
         if self.path == "/":
-            filas = []
-            for ruta, (nombre, _) in ARCHIVOS.items():
-                p = DATA / nombre
-                estado = f"{p.stat().st_size / 1024:.0f} KB" if p.exists() else "todavía no existe"
-                filas.append(f'<li><a href="{ruta}">{nombre}</a> · {estado}</li>')
+            filas = [f'<li><a href="{ruta}">{ruta.lstrip("/")}</a> · {p.stat().st_size / 1024:.0f} KB</li>'
+                     for ruta, (p, _) in archivos.items()] or ["<li>Todavía no hay resultados.</li>"]
             html = ("<!doctype html><meta charset='utf-8'><title>Etiquetado de fotos</title>"
                     "<body style='font-family:sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem'>"
                     "<h1>Piloto de etiquetado de fotos</h1><ul>" + "".join(filas) + "</ul></body>")
             return self._texto(200, html, "text/html; charset=utf-8")
-        if self.path in ARCHIVOS:
-            nombre, tipo = ARCHIVOS[self.path]
-            p = DATA / nombre
-            if not p.exists():
-                return self._texto(404, "Todavía no hay resultados. Ejecuta: python etiquetar.py recoger")
+        if self.path in archivos:
+            p, tipo = archivos[self.path]
+            nombre = self.path.strip("/").replace("/", "_")
             cuerpo = p.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", tipo)

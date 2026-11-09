@@ -48,8 +48,19 @@ python etiquetar.py todo --forzar     # vuelve a enviar todos los modelos
 python etiquetar.py enviar --modelos claude-sonnet-5-5 --forzar   # o solo uno
 ```
 
+### Otra tanda en una carpeta distinta (p. ej. el archivo de 2025)
+Cada tanda va en su propia subcarpeta de `datos/`, así no pisa resultados anteriores. En la consola:
+```bash
+export BOX_FOLDER_ID=302472928787 INCLUIR_RUTA=true MAX_FOTOS=10000 \
+       MODELOS=claude-haiku-5-5 DATA_DIR=/app/datos/2025
+python etiquetar.py listar
+python etiquetar.py todo
+```
+El `export` solo dura mientras la consola está abierta: si vuelves más tarde, repítelo antes de
+`estado` o `recoger`. Si hay muchas fotos, el script las reparte solo en varios lotes.
+
 ## 4. Descargar los resultados
-Abre `https://<tu-dominio>/` con el usuario y la contraseña de descarga y baja `resultados.csv`
+Abre `https://<tu-dominio>/` con el usuario y la contraseña de descarga y baja `resultados.csv` (o `2025/resultados.csv` para esa tanda)
 (una fila por foto y modelo, con enlace a Box y columnas vacías `revision_ok` y `notas_revision`).
 
 ## 5. Al terminar
