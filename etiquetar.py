@@ -551,7 +551,7 @@ def cmd_enviar(args):
                         "messages": [{"role": "user", "content": contenido}],
                     },
                 })
-            lote = cliente.messages.batches.create(requests=peticiones)
+            lote = crear_lote(cliente, peticiones)
             lotes[modelo].append(lote.id)
             escribir_json(LOTES, lotes)
             hechas_m.update(f["id"] for f in grupo)
@@ -559,6 +559,25 @@ def cmd_enviar(args):
             print(f"Lote {k}/{len(grupos_m)} enviado para {modelo}: {lote.id} ({len(peticiones)} fotos)")
             del peticiones
     print("Los lotes suelen tardar de minutos a unas horas (máximo 24 h). Consulta con: python etiquetar.py estado")
+
+
+def crear_lote(cliente, peticiones, intentos=40):
+    """Crea un lote; si la API está saturada o hay demasiados lotes en cola, espera y reintenta."""
+    for i in range(intentos):
+        try:
+            return cliente.messages.batches.create(requests=peticiones)
+        except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError) as e:
+            espera = min(600, 60 * (i + 1))
+            print(f"  API ocupada o límite de cola ({type(e).__name__}); reintento en {espera // 60} min...")
+            time.sleep(espera)
+        except anthropic.APIStatusError as e:
+            if e.status_code in (429, 529):
+                espera = min(600, 60 * (i + 1))
+                print(f"  API ocupada ({e.status_code}); reintento en {espera // 60} min...")
+                time.sleep(espera)
+            else:
+                raise
+    raise RuntimeError("No se pudo crear el lote tras muchos reintentos. Relanza más tarde: reanudará.")
 
 
 class EstadoModelo:
@@ -853,7 +872,7 @@ def cmd_flota(args):
                     "system": [{"type": "text", "text": SYSTEM_FLOTA, "cache_control": {"type": "ephemeral"}}],
                     "tools": [HERRAMIENTA_FLOTA], "tool_choice": {"type": "auto"},
                     "messages": [{"role": "user", "content": contenido}]}})
-            lote = cliente.messages.batches.create(requests=peticiones)
+            lote = crear_lote(cliente, peticiones)
             estado["lotes"].append(lote.id)
             escribir_json(LOTES_FLOTA, estado)
             print(f"Lote de flota enviado: {lote.id} ({len(peticiones)} campañas)")
