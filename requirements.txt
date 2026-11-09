@@ -1,0 +1,5 @@
+anthropic>=0.40
+requests>=2.31
+pillow>=10.0
+pillow-heif>=0.16
+python-dotenv>=1.0
