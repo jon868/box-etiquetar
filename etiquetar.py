@@ -265,12 +265,22 @@ def cmd_listar(_args):
         print(f"  {n:4d}  {carpeta}")
 
 
+def modelos_activos(args):
+    if getattr(args, "modelos", None):
+        return [m.strip() for m in args.modelos.split(",") if m.strip()]
+    return MODELOS
+
+
 def cmd_enviar(args):
     fotos = leer_json(MANIFEST)
     if not fotos:
         sys.exit("No hay manifest. Ejecuta primero: python etiquetar.py listar")
-    if leer_json(LOTES) and not args.forzar:
-        sys.exit("Ya hay lotes enviados (datos/lotes.json). Usa --forzar para crear otros nuevos.")
+    modelos = modelos_activos(args)
+    lotes = leer_json(LOTES, {}) or {}
+    repetidos = [m for m in modelos if m in lotes]
+    if repetidos and not args.forzar:
+        sys.exit(f"Ya hay lote para {', '.join(repetidos)}. Usa --forzar para sustituirlo "
+                 f"(o --modelos para enviar solo otros).")
 
     print(f"Preparando {len(fotos)} miniaturas (se guardan en {CACHE}/)...")
     peticiones_base, tokens_img, fallos = [], 0, []
@@ -300,7 +310,7 @@ def cmd_enviar(args):
     tokens_fijos = 1500  # instrucciones + esquema, aprox.
     print("\nCoste estimado (precios Batch orientativos):")
     total = 0.0
-    for modelo in MODELOS:
+    for modelo in modelos:
         pin, pout = precio(modelo)
         coste = ((tokens_img + n * tokens_fijos) * pin + n * 400 * pout) / 1e6
         total += coste
@@ -310,23 +320,24 @@ def cmd_enviar(args):
         sys.exit("Cancelado. No se ha enviado nada.")
 
     cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
-    lotes = {}
-    for idx, modelo in enumerate(MODELOS):
+    for modelo in modelos:
+        # tool_choice "auto": algunos modelos (p. ej. Sonnet 5.5) no aceptan forzar la herramienta.
+        # Las instrucciones ya piden usar siempre guardar_ficha.
         peticiones = [{
-            "custom_id": f"m{idx}_{file_id}",
+            "custom_id": f"f_{file_id}",
             "params": {
                 "model": modelo,
-                "max_tokens": 1024,
+                "max_tokens": 1500,
                 "system": [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
                 "tools": [HERRAMIENTA],
-                "tool_choice": {"type": "tool", "name": "guardar_ficha"},
+                "tool_choice": {"type": "auto"},
                 "messages": [{"role": "user", "content": contenido}],
             },
         } for file_id, contenido in peticiones_base]
         lote = cliente.messages.batches.create(requests=peticiones)
         lotes[modelo] = lote.id
+        escribir_json(LOTES, lotes)
         print(f"Lote enviado para {modelo}: {lote.id}")
-    escribir_json(LOTES, lotes)
     print("Los lotes suelen tardar de minutos a unas horas (máximo 24 h). Consulta con: python etiquetar.py estado")
 
 
@@ -363,7 +374,7 @@ def cmd_recoger(_args):
               "apta_propuesta", "descripcion", "palabras_clave", "confianza", "uso_autorizado", "coste_usd",
               "revision_ok", "notas_revision"]
     filas, crudo = [], []
-    coste_modelo, errores = Counter(), Counter()
+    coste_modelo, errores, motivos = Counter(), Counter(), {}
     for modelo, lote_id in lotes.items():
         pin, pout = precio(modelo)
         for r in cliente.messages.batches.results(lote_id):
@@ -371,10 +382,25 @@ def cmd_recoger(_args):
             foto = fotos.get(file_id, {"nombre": "?", "ruta": ""})
             if r.result.type != "succeeded":
                 errores[modelo] += 1
-                crudo.append({"modelo": modelo, "file_id": file_id, "error": r.result.type})
+                motivo = r.result.type
+                err = getattr(r.result, "error", None)
+                if err is not None:
+                    interno = getattr(err, "error", err)
+                    motivo = f"{r.result.type}: {getattr(interno, 'message', interno)}"
+                motivos.setdefault(modelo, motivo)
+                crudo.append({"modelo": modelo, "file_id": file_id, "error": motivo})
                 continue
             msg = r.result.message
-            ficha = next((b.input for b in msg.content if b.type == "tool_use"), {})
+            ficha = next((b.input for b in msg.content if b.type == "tool_use"), None)
+            if ficha is None:  # sin herramienta: intentar leer un JSON del texto
+                texto = "".join(getattr(b, "text", "") for b in msg.content)
+                try:
+                    ficha = json.loads(texto[texto.index("{"): texto.rindex("}") + 1])
+                except ValueError:
+                    errores[modelo] += 1
+                    motivos.setdefault(modelo, "respuesta sin ficha")
+                    crudo.append({"modelo": modelo, "file_id": file_id, "error": "sin ficha", "texto": texto[:500]})
+                    continue
             u = msg.usage
             tin = (u.input_tokens + (u.cache_creation_input_tokens or 0) * 1.25
                    + (u.cache_read_input_tokens or 0) * 0.1)
@@ -403,11 +429,14 @@ def cmd_recoger(_args):
     print(f"\nResultados: {RESULTADOS_CSV} ({len(filas)} filas)")
     for modelo in lotes:
         print(f"  {modelo:22s} coste real ≈ {coste_modelo[modelo]:.3f} $   errores: {errores[modelo]}")
+        if modelo in motivos:
+            print(f"      primer error: {motivos[modelo]}")
     por_foto = {}
     for f in filas:
         por_foto.setdefault(f["file_id"], {})[f["modelo"]] = f
-    if len(MODELOS) >= 2:
-        a, b = MODELOS[0], MODELOS[1]
+    modelos_lote = list(lotes)
+    if len(modelos_lote) >= 2:
+        a, b = modelos_lote[0], modelos_lote[1]
         pares = [d for d in por_foto.values() if a in d and b in d]
         if pares:
             print(f"\nCoincidencia {a} vs {b} ({len(pares)} fotos):")
@@ -428,7 +457,8 @@ def cmd_recoger(_args):
 def cmd_todo(args):
     if not MANIFEST.exists():
         cmd_listar(args)
-    if not leer_json(LOTES) or args.forzar:
+    lotes = leer_json(LOTES, {}) or {}
+    if args.forzar or any(m not in lotes for m in modelos_activos(args)):
         cmd_enviar(args)
     cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
     while True:
@@ -443,7 +473,8 @@ def main():
     p = argparse.ArgumentParser(description="Piloto de etiquetado de fotos de Box con Claude")
     p.add_argument("comando", choices=["listar", "enviar", "estado", "recoger", "todo"])
     p.add_argument("--si", action="store_true", help="no pedir confirmación antes de enviar")
-    p.add_argument("--forzar", action="store_true", help="crear lotes nuevos aunque ya existan")
+    p.add_argument("--forzar", action="store_true", help="sustituir el lote de los modelos indicados")
+    p.add_argument("--modelos", help="modelos a enviar, separados por comas (por defecto, MODELOS)")
     args = p.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
     {"listar": cmd_listar, "enviar": cmd_enviar, "estado": cmd_estado,
