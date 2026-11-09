@@ -41,6 +41,13 @@ python etiquetar.py estado
 python etiquetar.py recoger
 ```
 
+### Repetir el piloto (p. ej. tras cambiar las instrucciones)
+```bash
+python etiquetar.py listar            # rehace el listado (agrupa fotos repetidas)
+python etiquetar.py todo --forzar     # vuelve a enviar todos los modelos
+python etiquetar.py enviar --modelos claude-sonnet-5-5 --forzar   # o solo uno
+```
+
 ## 4. Descargar los resultados
 Abre `https://<tu-dominio>/` con el usuario y la contraseña de descarga y baja `resultados.csv`
 (una fila por foto y modelo, con enlace a Box y columnas vacías `revision_ok` y `notas_revision`).

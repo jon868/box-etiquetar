@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Piloto de etiquetado de fotos de Box con la API de Claude (Batch API).
+Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 2
 alegria-activity
 
 Uso:
-  python etiquetar.py listar          Recorre la carpeta de Box y guarda datos/manifest.json
-  python etiquetar.py enviar [--si]   Prepara miniaturas, estima el coste y crea un lote por modelo
-  python etiquetar.py estado          Muestra el estado de los lotes
-  python etiquetar.py recoger         Descarga resultados y genera datos/resultados.csv
-  python etiquetar.py todo [--si]     Todo seguido, esperando a que terminen los lotes
+  python etiquetar.py listar                 Recorre la carpeta de Box y guarda datos/manifest.json
+                                             (agrupa las fotos repetidas en varias carpetas)
+  python etiquetar.py enviar [--si]          Prepara miniaturas, estima el coste y crea un lote por modelo
+         [--modelos m1,m2] [--forzar]        (solo esos modelos / sustituir lotes existentes)
+  python etiquetar.py estado                 Muestra el estado de los lotes
+  python etiquetar.py recoger                Descarga resultados y genera datos/resultados.csv
+  python etiquetar.py todo [--si]            Todo seguido, esperando a que terminen los lotes
 
 Solo LEE de Box. No escribe, mueve ni borra nada allí.
 """
@@ -37,6 +39,8 @@ except ImportError:
 
 load_dotenv()
 
+VERSION = "v2"
+
 # ---------------------------------------------------------------- configuración
 API = "https://api.box.com/2.0"
 CARPETA_RAIZ = os.getenv("BOX_FOLDER_ID", "379464633435")  # 15. Web 2025 / Fotos y videos / Fotos
@@ -44,7 +48,9 @@ EXCLUIR = {x.strip() for x in os.getenv("BOX_EXCLUDE_IDS", "").split(",") if x.s
 MODELOS = [m.strip() for m in os.getenv("MODELOS", "claude-haiku-5-5,claude-sonnet-5-5").split(",") if m.strip()]
 MAX_FOTOS = int(os.getenv("MAX_FOTOS", "250"))
 LADO = int(os.getenv("LADO_MAX_PX", "1024"))
+LADO_REF = int(os.getenv("LADO_REF_PX", "512"))
 INCLUIR_RUTA = os.getenv("INCLUIR_RUTA", "false").lower() == "true"
+USAR_REFERENCIAS = os.getenv("USAR_REFERENCIAS", "true").lower() == "true"
 
 # Precios Batch en USD por millón de tokens (entrada, salida). Orientativos: revísalos en la Console.
 PRECIOS_BATCH = {
@@ -65,31 +71,61 @@ EXTENSIONES = {"jpg", "jpeg", "png", "webp", "heic", "heif", "tif", "tiff"}
 FLOTA = ["13,80", "Airstream", "CajaMar", "Camión rígido", "Cotazero",
          "Furgón", "Plataformas", "Semirremolque", "Set TV"]
 
+# Una foto exterior de cada vehículo, del "Maestro vehículos (Claude)" en Box (Cotazero solo tiene planos).
+REFERENCIAS = [
+    ("Airstream", "2400251591808", "remolque compacto rotulado que se abre por un lateral como escaparate, con rampa"),
+    ("Furgón", "2400253604413", "furgoneta grande con carrocería tipo caja, puerta lateral, escalera y toldo"),
+    ("Camión rígido", "2400250967290", "camión rígido con caja expositiva de laterales acristalados"),
+    ("Semirremolque", "2400249539182", "tráiler de gran tamaño con laterales expandibles"),
+    ("13,80", "2400262689058", "vehículo de 13,80 m con aspecto de autocar"),
+    ("CajaMar", "2400551454784", "camión carrozado con escalera y rampa de acceso lateral"),
+    ("Plataformas", "2400244907579", "módulo-remolque blanco grande tipo sala, con ventanas"),
+    ("Set TV", "2400249995707", "módulo plató de TV con terraza superior"),
+]
+
 LINEAS = ["Roadshow", "Acciones pedagógicas y sensibilización", "Marca y patrocinio",
-          "Promoción y producto", "Manufacturing", "Agencia", "otro"]
+          "Promoción y producto", "Manufacturing", "Agencia"]
+
+DEFINICIONES = """\
+- Roadshow: giras itinerantes con un vehículo que recorre varias localidades.
+- Acciones pedagógicas y sensibilización: talleres, exposiciones y actividades educativas o de concienciación \
+(salud, prevención, ciencia, medioambiente, alimentación...).
+- Marca y patrocinio: activaciones de marca, hospitality y presencia en eventos deportivos o patrocinios.
+- Promoción y producto: lanzamientos, sampling y demostraciones de producto.
+- Manufacturing: diseño y fabricación de unidades móviles a medida para clientes (sanitarias, oficinas o \
+sucursales móviles, puestos de mando, hospitality, motorhomes, bibliotecas...), aunque no haya evento ni público.
+- Agencia: el equipo de alegria-activity (retratos del personal), sus oficinas e instalaciones."""
 
 # ---------------------------------------------------------------- prompt y esquema
 SYSTEM = f"""Eres documentalista de alegria-activity, una agencia de marketing experiencial que hace campañas, \
-roadshows y exposiciones itinerantes en vehículos de flota propia. Catalogas fotos del archivo de la agencia \
-para poder encontrarlas después al preparar propuestas comerciales y la web.
+roadshows y exposiciones itinerantes en vehículos de flota propia, y que además fabrica unidades móviles a \
+medida para clientes. Catalogas fotos del archivo de la agencia para poder encontrarlas después al preparar \
+propuestas comerciales y la web.
 
-Rellena SIEMPRE la ficha con la herramienta guardar_ficha. Reglas:
+Usa SIEMPRE la herramienta guardar_ficha, una sola vez por foto. Usa exactamente los valores permitidos de cada \
+lista, sin inventar otros. Reglas:
 
 1. Describe solo lo que se ve. Si dudas, usa "desconocido" o confianza "baja". Nunca inventes.
-2. Vehículo de la flota: {", ".join(FLOTA)}. Elige uno de ellos solo si lo reconoces con claridad \
-(la Airstream es la caravana de aluminio pulido de formas redondeadas). Si hay un vehículo pero no puedes \
-asegurar cuál de la flota es, usa "otro vehículo" o "desconocido" y rellena bien tipo_vehiculo.
-3. Marca o cliente: solo si un logotipo o nombre se lee en la imagen. El nombre del archivo puede dar una pista; \
-si la marca la sacas del nombre del archivo y no de la imagen, indica fuente_marca = "nombre de archivo".
+2. Vehículo de la flota ({", ".join(FLOTA)}): al principio del mensaje tienes una foto de referencia de cada \
+uno (salvo Cotazero). Elige uno de la flota solo si coincide claramente con su referencia en forma y estructura \
+(la rotulación cambia en cada campaña, no te fíes de los colores). Muchas fotos son de unidades fabricadas para \
+clientes, que NO son de la flota: en ese caso usa "otro vehículo". Si no hay vehículo, "sin vehículo".
+3. Marca: el nombre corto de la marca o cliente principal que se lee en la imagen (p. ej. "Repsol", \
+"Fundación DISA"), sin frases. Vacío si no hay ninguna. Si la sacas del nombre del archivo y no de la imagen, \
+fuente_marca = "nombre de archivo".
 4. Personas: NO identifiques a nadie ni describas rasgos físicos de personas concretas. Indica solo cuántas hay \
 y qué están haciendo.
 5. posibles_menores: "sí" si aparecen niños o adolescentes; "dudoso" si no se puede descartar; "no" en otro caso.
-6. linea_servicio: la línea de negocio que mejor ilustra la foto.
+6. Líneas de servicio (puedes marcar de 1 a 3 si la foto sirve para varias; la primera es la principal):
+{DEFINICIONES}
 7. Descripción (1-2 frases) y palabras clave (5-10) en castellano, pensadas para buscar después: vehículo, \
 espacio (interior/exterior), actividad, tipo de lugar (plaza, recinto ferial, colegio, nave...) y elementos \
 (pantallas, mostrador, carpa, photocall, gafas de realidad virtual...).
 8. apta_propuesta: true si la foto tiene calidad y encuadre suficientes para enseñarla a un cliente.
 """
+
+TIPOS_VEHICULO = ["caravana", "remolque", "furgoneta", "camión", "semirremolque/tráiler", "autobús/autocar",
+                  "plataforma/escenario móvil", "coche", "otro", "ninguno"]
 
 HERRAMIENTA = {
     "name": "guardar_ficha",
@@ -98,14 +134,13 @@ HERRAMIENTA = {
         "type": "object",
         "properties": {
             "vehiculo": {"type": "string", "enum": FLOTA + ["otro vehículo", "sin vehículo", "desconocido"]},
-            "tipo_vehiculo": {"type": "string", "enum": [
-                "caravana", "furgoneta", "camión", "semirremolque/tráiler", "plataforma/escenario móvil",
-                "coche", "otro", "ninguno"]},
+            "tipo_vehiculo": {"type": "string", "enum": TIPOS_VEHICULO},
             "plano": {"type": "string", "enum": [
                 "exterior del vehículo", "interior del vehículo", "evento con público", "montaje o producción",
-                "detalle", "equipo u oficina", "otro"]},
-            "linea_servicio": {"type": "string", "enum": LINEAS},
-            "marca_visible": {"type": "string", "description": "Marca o cliente visible; vacío si ninguna."},
+                "detalle", "retrato o equipo", "otro"]},
+            "lineas_servicio": {"type": "array", "minItems": 1, "maxItems": 3,
+                                "items": {"type": "string", "enum": LINEAS}},
+            "marca_visible": {"type": "string", "description": "Nombre corto de la marca; vacío si ninguna."},
             "fuente_marca": {"type": "string", "enum": ["imagen", "nombre de archivo", "ninguna"]},
             "personas": {"type": "string", "enum": ["ninguna", "1-3", "4-15", "más de 15"]},
             "posibles_menores": {"type": "string", "enum": ["sí", "no", "dudoso"]},
@@ -115,11 +150,12 @@ HERRAMIENTA = {
             "palabras_clave": {"type": "array", "items": {"type": "string"}},
             "confianza": {"type": "string", "enum": ["alta", "media", "baja"]},
         },
-        "required": ["vehiculo", "tipo_vehiculo", "plano", "linea_servicio", "marca_visible", "fuente_marca",
+        "required": ["vehiculo", "tipo_vehiculo", "plano", "lineas_servicio", "marca_visible", "fuente_marca",
                      "personas", "posibles_menores", "calidad", "apta_propuesta", "descripcion",
                      "palabras_clave", "confianza"],
     },
 }
+PROPS = HERRAMIENTA["input_schema"]["properties"]
 
 
 # ---------------------------------------------------------------- Box (solo lectura)
@@ -171,7 +207,7 @@ def listar_carpeta(folder_id, ruta, salida):
     offset = 0
     while True:
         r = box_get(f"{API}/folders/{folder_id}/items",
-                    params={"fields": "id,type,name,size,extension", "limit": 1000, "offset": offset})
+                    params={"fields": "id,type,name,size,extension,sha1", "limit": 1000, "offset": offset})
         r.raise_for_status()
         j = r.json()
         for it in j["entries"]:
@@ -180,7 +216,8 @@ def listar_carpeta(folder_id, ruta, salida):
             if it["type"] == "folder":
                 listar_carpeta(it["id"], f"{ruta}/{it['name']}" if ruta else it["name"], salida)
             elif it["type"] == "file" and (it.get("extension") or "").lower() in EXTENSIONES:
-                salida.append({"id": it["id"], "nombre": it["name"], "ruta": ruta, "tamano": it.get("size", 0)})
+                salida.append({"id": it["id"], "nombre": it["name"], "ruta": ruta,
+                               "tamano": it.get("size", 0), "sha1": it.get("sha1")})
         offset += len(j["entries"])
         if not j["entries"] or offset >= j.get("total_count", 0):
             break
@@ -212,22 +249,46 @@ def box_representacion(file_id):
     return None
 
 
-def miniatura(foto):
+def miniatura(file_id, lado=LADO, calidad=85):
     CACHE.mkdir(parents=True, exist_ok=True)
-    destino = CACHE / f"{foto['id']}.jpg"
+    destino = CACHE / (f"{file_id}.jpg" if lado == LADO else f"{file_id}_{lado}.jpg")
     if destino.exists():
         return destino.read_bytes()
-    datos = box_representacion(foto["id"])
-    if datos is None:
-        r = box_get(f"{API}/files/{foto['id']}/content")
-        r.raise_for_status()
-        datos = r.content
+    base = CACHE / f"{file_id}.jpg"
+    if base.exists():
+        datos = base.read_bytes()
+    else:
+        datos = box_representacion(file_id)
+        if datos is None:
+            r = box_get(f"{API}/files/{file_id}/content")
+            r.raise_for_status()
+            datos = r.content
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(datos))).convert("RGB")
-    img.thumbnail((LADO, LADO))
+    img.thumbnail((lado, lado))
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=85)
+    img.save(buf, "JPEG", quality=calidad)
     destino.write_bytes(buf.getvalue())
     return buf.getvalue()
+
+
+def bloque_imagen(jpg):
+    return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                        "data": base64.b64encode(jpg).decode()}}
+
+
+def bloques_referencia():
+    """Fotos de referencia de la flota; van primero y se cachean, así se pagan casi una sola vez."""
+    bloques, tokens = [{"type": "text", "text": "FOTOS DE REFERENCIA DE LA FLOTA (no son la foto a catalogar):"}], 0
+    for nombre, file_id, desc in REFERENCIAS:
+        try:
+            jpg = miniatura(file_id, lado=LADO_REF, calidad=80)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠ referencia de {nombre} no disponible: {str(e)[:100]}")
+            continue
+        tokens += tokens_imagen(jpg)
+        bloques += [{"type": "text", "text": f"Referencia «{nombre}»: {desc}"}, bloque_imagen(jpg)]
+    bloques[-1]["cache_control"] = {"type": "ephemeral"}
+    return bloques, tokens
 
 
 # ---------------------------------------------------------------- utilidades
@@ -249,26 +310,71 @@ def precio(modelo):
     return PRECIOS_BATCH.get(modelo, (1.0, 5.0))
 
 
-# ---------------------------------------------------------------- comandos
-def cmd_listar(_args):
-    raiz = box_get(f"{API}/folders/{CARPETA_RAIZ}", params={"fields": "name,path_collection"})
-    raiz.raise_for_status()
-    print(f"Carpeta: {raiz.json()['name']} ({CARPETA_RAIZ})")
-    fotos = []
-    listar_carpeta(CARPETA_RAIZ, "", fotos)
-    total = len(fotos)
-    fotos = fotos[:MAX_FOTOS]
-    escribir_json(MANIFEST, fotos)
-    print(f"Imágenes encontradas: {total} · en el piloto: {len(fotos)} (MAX_FOTOS={MAX_FOTOS})")
-    print(f"Tamaño original: {sum(f['tamano'] for f in fotos) / 1e9:.2f} GB")
-    for carpeta, n in Counter((f["ruta"].split("/")[0] or "(raíz)") for f in fotos).most_common():
-        print(f"  {n:4d}  {carpeta}")
+def rutas(foto):
+    return foto.get("rutas") or [foto.get("ruta", "")]
+
+
+def carpetas_linea(foto):
+    return {r.split("/")[0] for r in rutas(foto)} & set(LINEAS)
+
+
+def normalizar(ficha):
+    """Corrige mayúsculas y aparta los valores fuera de lista. Devuelve los valores corregidos."""
+    fuera = []
+    for campo, spec in PROPS.items():
+        v = ficha.get(campo)
+        if "enum" in spec:
+            mapa = {e.lower(): e for e in spec["enum"]}
+            if isinstance(v, str) and v.lower() in mapa:
+                ficha[campo] = mapa[v.lower()]
+            elif v not in (None, ""):
+                fuera.append(f"{campo}={v}")
+                ficha[campo] = next((x for x in ("desconocido", "otro", "ninguna") if x in spec["enum"]), "")
+        elif spec.get("type") == "array" and "enum" in spec.get("items", {}):
+            mapa = {e.lower(): e for e in spec["items"]["enum"]}
+            lista = v if isinstance(v, list) else [v] if v else []
+            buenos = []
+            for x in lista:
+                if isinstance(x, str) and x.lower() in mapa:
+                    if mapa[x.lower()] not in buenos:
+                        buenos.append(mapa[x.lower()])
+                else:
+                    fuera.append(f"{campo}={x}")
+            ficha[campo] = buenos
+    return fuera
 
 
 def modelos_activos(args):
     if getattr(args, "modelos", None):
         return [m.strip() for m in args.modelos.split(",") if m.strip()]
     return MODELOS
+
+
+# ---------------------------------------------------------------- comandos
+def cmd_listar(_args):
+    raiz = box_get(f"{API}/folders/{CARPETA_RAIZ}", params={"fields": "name"})
+    raiz.raise_for_status()
+    print(f"Carpeta: {raiz.json()['name']} ({CARPETA_RAIZ})")
+    archivos = []
+    listar_carpeta(CARPETA_RAIZ, "", archivos)
+    unicas = {}
+    for f in archivos:
+        clave = f.get("sha1") or f["id"]
+        if clave in unicas:
+            unicas[clave]["rutas"].append(f["ruta"])
+            unicas[clave]["ids"].append(f["id"])
+        else:
+            unicas[clave] = {**f, "rutas": [f["ruta"]], "ids": [f["id"]]}
+    fotos = list(unicas.values())
+    total = len(fotos)
+    fotos = fotos[:MAX_FOTOS]
+    escribir_json(MANIFEST, fotos)
+    print(f"Archivos de imagen: {len(archivos)} · fotos distintas: {total} "
+          f"({len(archivos) - total} repetidas en varias carpetas)")
+    print(f"En el piloto: {len(fotos)} (MAX_FOTOS={MAX_FOTOS}) · "
+          f"tamaño original {sum(f['tamano'] for f in fotos) / 1e9:.2f} GB")
+    for carpeta, n in Counter((r.split("/")[0] or "(raíz)") for f in fotos for r in rutas(f)).most_common():
+        print(f"  {n:4d}  {carpeta}")
 
 
 def cmd_enviar(args):
@@ -282,23 +388,25 @@ def cmd_enviar(args):
         sys.exit(f"Ya hay lote para {', '.join(repetidos)}. Usa --forzar para sustituirlo "
                  f"(o --modelos para enviar solo otros).")
 
+    refs, tokens_refs = bloques_referencia() if USAR_REFERENCIAS else ([], 0)
+    if refs:
+        print(f"Referencias de flota: {(len(refs) - 1) // 2} fotos (~{tokens_refs} tokens, en caché)")
+
     print(f"Preparando {len(fotos)} miniaturas (se guardan en {CACHE}/)...")
     peticiones_base, tokens_img, fallos = [], 0, []
     for i, foto in enumerate(fotos, 1):
         try:
-            jpg = miniatura(foto)
+            jpg = miniatura(foto["id"])
         except Exception as e:  # noqa: BLE001
             fallos.append((foto["nombre"], str(e)[:120]))
             continue
         tokens_img += tokens_imagen(jpg)
         texto = f"Archivo: {foto['nombre']}"
-        if INCLUIR_RUTA and foto["ruta"]:
-            texto += f"\nCarpeta: {foto['ruta']}"
-        peticiones_base.append((foto["id"], [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
-                                         "data": base64.b64encode(jpg).decode()}},
-            {"type": "text", "text": texto},
-        ]))
+        if INCLUIR_RUTA and any(rutas(foto)):
+            texto += "\nCarpeta: " + " | ".join(r for r in rutas(foto) if r)
+        contenido = refs + [{"type": "text", "text": "FOTO A CATALOGAR:"}, bloque_imagen(jpg),
+                            {"type": "text", "text": texto}]
+        peticiones_base.append((foto["id"], contenido))
         if i % 25 == 0:
             print(f"  {i}/{len(fotos)}")
     for nombre, err in fallos:
@@ -307,12 +415,12 @@ def cmd_enviar(args):
         sys.exit("No se ha podido preparar ninguna imagen.")
 
     n = len(peticiones_base)
-    tokens_fijos = 1500  # instrucciones + esquema, aprox.
-    print("\nCoste estimado (precios Batch orientativos):")
+    tokens_fijos = 2200  # instrucciones + esquema, aprox.
+    print("\nCoste estimado (precios Batch orientativos; referencias contadas al 30 % por la caché):")
     total = 0.0
     for modelo in modelos:
         pin, pout = precio(modelo)
-        coste = ((tokens_img + n * tokens_fijos) * pin + n * 400 * pout) / 1e6
+        coste = ((tokens_img + n * (tokens_fijos + 0.3 * tokens_refs)) * pin + n * 450 * pout) / 1e6
         total += coste
         print(f"  {modelo:22s} {n} fotos ≈ {coste:.2f} $")
     print(f"  TOTAL ≈ {total:.2f} $")
@@ -322,7 +430,6 @@ def cmd_enviar(args):
     cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
     for modelo in modelos:
         # tool_choice "auto": algunos modelos (p. ej. Sonnet 5.5) no aceptan forzar la herramienta.
-        # Las instrucciones ya piden usar siempre guardar_ficha.
         peticiones = [{
             "custom_id": f"f_{file_id}",
             "params": {
@@ -369,10 +476,10 @@ def cmd_recoger(_args):
     if any(b.processing_status != "ended" for b in st.values()):
         sys.exit("Todavía hay lotes en curso. Vuelve a probar más tarde.")
 
-    campos = ["file_id", "nombre", "carpeta", "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
-              "linea_servicio", "marca_visible", "fuente_marca", "personas", "posibles_menores", "calidad",
-              "apta_propuesta", "descripcion", "palabras_clave", "confianza", "uso_autorizado", "coste_usd",
-              "revision_ok", "notas_revision"]
+    campos = ["file_id", "nombre", "carpetas", "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
+              "linea_principal", "lineas_servicio", "marca_visible", "fuente_marca", "personas",
+              "posibles_menores", "calidad", "apta_propuesta", "descripcion", "palabras_clave", "confianza",
+              "fuera_de_lista", "uso_autorizado", "coste_usd", "version", "revision_ok", "notas_revision"]
     filas, crudo = [], []
     coste_modelo, errores, motivos = Counter(), Counter(), {}
     for modelo, lote_id in lotes.items():
@@ -401,22 +508,30 @@ def cmd_recoger(_args):
                     motivos.setdefault(modelo, "respuesta sin ficha")
                     crudo.append({"modelo": modelo, "file_id": file_id, "error": "sin ficha", "texto": texto[:500]})
                     continue
+            ficha = dict(ficha)
+            fuera = normalizar(ficha)
             u = msg.usage
             tin = (u.input_tokens + (u.cache_creation_input_tokens or 0) * 1.25
                    + (u.cache_read_input_tokens or 0) * 0.1)
             coste = (tin * pin + u.output_tokens * pout) / 1e6
             coste_modelo[modelo] += coste
-            crudo.append({"modelo": modelo, "file_id": file_id, "ficha": ficha})
+            crudo.append({"modelo": modelo, "file_id": file_id, "ficha": ficha, "fuera_de_lista": fuera})
+            lineas = ficha.get("lineas_servicio") or []
             filas.append({
-                "file_id": file_id, "nombre": foto["nombre"], "carpeta": foto["ruta"],
+                "file_id": file_id, "nombre": foto["nombre"],
+                "carpetas": " | ".join(r or "(raíz)" for r in rutas(foto)),
                 "enlace_box": f"https://app.box.com/file/{file_id}", "modelo": modelo,
-                **{k: ficha.get(k, "") for k in HERRAMIENTA["input_schema"]["properties"]},
-                "palabras_clave": ", ".join(ficha.get("palabras_clave", [])),
+                **{k: ficha.get(k, "") for k in PROPS},
+                "linea_principal": lineas[0] if lineas else "",
+                "lineas_servicio": ", ".join(lineas),
+                "palabras_clave": ", ".join(ficha.get("palabras_clave", []) or []),
+                "fuera_de_lista": "; ".join(fuera),
                 "uso_autorizado": "publicada en web" if CARPETA_RAIZ == "379464633435" else "pendiente",
-                "coste_usd": f"{coste:.5f}", "revision_ok": "", "notas_revision": "",
+                "coste_usd": f"{coste:.5f}", "version": VERSION, "revision_ok": "", "notas_revision": "",
+                "_lineas": set(lineas), "_carpetas": carpetas_linea(foto),
             })
 
-    filas.sort(key=lambda f: (f["carpeta"], f["nombre"], f["modelo"]))
+    filas.sort(key=lambda f: (f["carpetas"], f["nombre"], f["modelo"]))
     with RESULTADOS_CSV.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.DictWriter(fh, fieldnames=campos, extrasaction="ignore")
         w.writeheader()
@@ -426,29 +541,51 @@ def cmd_recoger(_args):
             fh.write(json.dumps(c, ensure_ascii=False) + "\n")
 
     # ---- resumen automático
-    print(f"\nResultados: {RESULTADOS_CSV} ({len(filas)} filas)")
+    print(f"\nResultados {VERSION}: {RESULTADOS_CSV} ({len(filas)} filas)")
     for modelo in lotes:
-        print(f"  {modelo:22s} coste real ≈ {coste_modelo[modelo]:.3f} $   errores: {errores[modelo]}")
+        fuera_n = sum(1 for f in filas if f["modelo"] == modelo and f["fuera_de_lista"])
+        print(f"  {modelo:22s} coste real ≈ {coste_modelo[modelo]:.3f} $   errores: {errores[modelo]}   "
+              f"fichas con valores fuera de lista: {fuera_n}")
         if modelo in motivos:
             print(f"      primer error: {motivos[modelo]}")
+
+    print("\nLínea de servicio frente a la carpeta (fotos en carpetas con nombre de línea):")
+    for modelo in lotes:
+        ev = [f for f in filas if f["modelo"] == modelo and f["_carpetas"]]
+        if ev:
+            alguna = sum(bool(f["_lineas"] & f["_carpetas"]) for f in ev)
+            principal = sum(f["linea_principal"] in f["_carpetas"] for f in ev)
+            print(f"  {modelo:22s} alguna coincide {alguna}/{len(ev)} = {alguna / len(ev):.0%}   "
+                  f"la principal {principal}/{len(ev)} = {principal / len(ev):.0%}")
+        por_linea = Counter()
+        aciertos = Counter()
+        for f in ev:
+            for c in f["_carpetas"]:
+                por_linea[c] += 1
+                aciertos[c] += c in f["_lineas"]
+        for c in LINEAS:
+            if por_linea[c]:
+                print(f"      {c:42s} {aciertos[c]}/{por_linea[c]}")
+
     por_foto = {}
     for f in filas:
         por_foto.setdefault(f["file_id"], {})[f["modelo"]] = f
-    modelos_lote = list(lotes)
-    if len(modelos_lote) >= 2:
-        a, b = modelos_lote[0], modelos_lote[1]
+    mods = list(lotes)
+    if len(mods) >= 2:
+        a, b = mods[0], mods[1]
         pares = [d for d in por_foto.values() if a in d and b in d]
         if pares:
             print(f"\nCoincidencia {a} vs {b} ({len(pares)} fotos):")
-            for campo in ("vehiculo", "plano", "linea_servicio", "posibles_menores", "apta_propuesta"):
+            for campo in ("vehiculo", "tipo_vehiculo", "plano", "linea_principal", "posibles_menores",
+                          "apta_propuesta"):
                 igual = sum(str(d[a][campo]) == str(d[b][campo]) for d in pares)
                 print(f"  {campo:18s} {igual / len(pares):5.0%}")
-    print("\nAcierto de línea de servicio frente a la carpeta (solo carpetas con nombre de línea):")
+
     for modelo in lotes:
-        evaluables = [f for f in filas if f["modelo"] == modelo and f["carpeta"].split("/")[0] in LINEAS]
-        if evaluables:
-            ok = sum(f["linea_servicio"] == f["carpeta"].split("/")[0] for f in evaluables)
-            print(f"  {modelo:22s} {ok}/{len(evaluables)} = {ok / len(evaluables):.0%}")
+        flota = Counter(f["vehiculo"] for f in filas if f["modelo"] == modelo and f["vehiculo"] in FLOTA)
+        if flota:
+            print(f"\nVehículos de la flota detectados por {modelo}: "
+                  + ", ".join(f"{k} {v}" for k, v in flota.most_common()))
     menores = {f["nombre"] for f in filas if f["posibles_menores"] in ("sí", "dudoso")}
     if menores:
         print(f"\nFotos marcadas con posibles menores ({len(menores)}): revisar antes de usarlas en material comercial.")
