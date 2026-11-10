@@ -999,10 +999,29 @@ def cmd_flota_recoger(_args):
 
 
 # ---------------------------------------------------------------- índice para el buscador del conector
+DESDE_FLOTA = {k.strip(): int(v) for k, v in (x.split("=") for x in
+               os.getenv("FLOTA_DESDE", "").split(";") if "=" in x)}   # p. ej. "13,80=2015;Semirremolque=2011"
+
+
+def vehiculo_campana_fiable(f):
+    """Vehículo de la campaña para el buscador: sin las asignaciones de confianza baja ni las anteriores
+    a la llegada de ese vehículo a la flota (FLOTA_DESDE)."""
+    texto = f.get("vehiculo_campana", "")
+    if f.get("confianza_vehiculo_campana") == "baja" and vehiculos_de(texto) and texto.split(" (")[0] in FLOTA:
+        return ""
+    camp = f.get("campana") or campana_de(f["carpetas"].split(" | ")[0])
+    anio = camp.split("/")[0]
+    if es_anio(anio):
+        quedan = [v for v in vehiculos_de(texto) if not (v in DESDE_FLOTA and int(anio) < DESDE_FLOTA[v])]
+        if vehiculos_de(texto) and all(v in FLOTA for v in vehiculos_de(texto)) and len(quedan) < len(vehiculos_de(texto)):
+            return ", ".join(quedan) if quedan else "vehículo anterior de la agencia"
+    return texto
+
+
 def vehiculo_foto(f):
     """La etiqueta de flota de una foto (Haiku) solo se mantiene si su campaña no la contradice."""
     v = f.get("vehiculo", "")
-    camp = f.get("vehiculo_campana")
+    camp = vehiculo_campana_fiable(f) if "vehiculo_campana" in f else None
     if v in FLOTA and camp is not None and camp != "" and v not in vehiculos_de(camp):
         return "otro vehículo"
     return v
@@ -1034,7 +1053,7 @@ def cmd_indice(args):
                 "id": fid, "nombre": f["nombre"], "carpetas": f["carpetas"], "campana": camp,
                 "cliente": f.get("cliente_carpeta") or cliente_de(f["carpetas"].split(" | ")[0]),
                 "anio": int(anio) if anio else None,
-                "vehiculo": vehiculo_foto(f), "vehiculo_campana": f.get("vehiculo_campana", ""),
+                "vehiculo": vehiculo_foto(f), "vehiculo_campana": vehiculo_campana_fiable(f),
                 "conf_vehiculo_campana": f.get("confianza_vehiculo_campana", ""),
                 "tipo_vehiculo": f.get("tipo_vehiculo", ""), "plano": f.get("plano", ""),
                 "lineas": [x.strip() for x in (f.get("lineas_servicio") or f.get("linea_servicio") or "").split(",") if x.strip()],

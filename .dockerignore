@@ -1,5 +1,6 @@
 .env
 datos/
 .venv/
+.git/
 __pycache__/
 *.pyc

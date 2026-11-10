@@ -88,6 +88,10 @@ Genera `flota_campanas.csv` (una fila por campaña, con columnas para confirmar)
 ```bash
 DATA_DIR=/app/datos python etiquetar.py indice --tandas /app/datos/archivo,/app/datos
 ```
+Opcional: año de llegada de cada vehículo a la flota, para descartar asignaciones anteriores:
+`export FLOTA_DESDE="13,80=2015;Semirremolque=2011"` antes de ejecutar `indice`.
+Las asignaciones de flota con confianza baja no se usan en el buscador.
+
 Genera `/app/datos/indice.json` (servido en `https://<tu-dominio>/indice.json` con la contraseña de descarga).
 El conector Box_alegria lo descarga con `INDICE_URL`, `INDICE_USUARIO` e `INDICE_PASSWORD`.
 
