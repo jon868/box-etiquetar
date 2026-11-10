@@ -79,9 +79,17 @@ Con el mismo `export` de la tanda:
 ```bash
 python etiquetar.py flota           # 3 fotos por campaña, pide confirmación, espera y recoge
 python etiquetar.py flota-recoger   # si cerraste antes de que terminara
+python etiquetar.py flota --revisar 13,80   # vuelve a consultar solo las campañas de ese vehículo y fusiona
 ```
 Genera `flota_campanas.csv` (una fila por campaña, con columnas para confirmar) y
 `resultados_flota.csv` (cada foto con el vehículo de su campaña).
+
+### Índice para el buscador del conector de Box
+```bash
+DATA_DIR=/app/datos python etiquetar.py indice --tandas /app/datos/archivo,/app/datos
+```
+Genera `/app/datos/indice.json` (servido en `https://<tu-dominio>/indice.json` con la contraseña de descarga).
+El conector Box_alegria lo descarga con `INDICE_URL`, `INDICE_USUARIO` e `INDICE_PASSWORD`.
 
 ## 4. Descargar los resultados
 Abre `https://<tu-dominio>/` con el usuario y la contraseña de descarga y baja `resultados.csv` (o `2025/resultados.csv` para esa tanda)
