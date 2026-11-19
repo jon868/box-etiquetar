@@ -440,6 +440,72 @@ def cmd_listar(_args):
         print(f"  {n:4d}  {carpeta}")
 
 
+SELECCION_CSV = DATA / "seleccion_fotos.csv"
+
+
+def _piloto(por_op, n):
+    """n oportunidades variadas: la mitad las de más ciudades (giras largas), el resto repartidas por años."""
+    ops = sorted(por_op, key=lambda o: (-len({f["ciudad"] for f in por_op[o] if f["ciudad"]}), o))
+    elegidas = ops[:max(1, n // 2)]
+    resto = sorted((o for o in ops if o not in elegidas), key=lambda o: (por_op[o][0].get("anio") or "", o))
+    if resto and n > len(elegidas):
+        paso = max(1, len(resto) // (n - len(elegidas)))
+        elegidas += resto[::paso][:n - len(elegidas)]
+    return elegidas
+
+
+def cmd_importar(args):
+    """Crea el manifest a partir de seleccion_fotos.csv de box-oportunidades (fotos.py seleccionar), en vez de
+    recorrer una carpeta. Cada foto lleva su oportunidad, cliente, año y ciudad, que van a la IA y al índice."""
+    origen = args.csv or os.getenv("SELECCION_URL", "")
+    if not origen:
+        sys.exit("Indica --csv con la ruta o la URL de seleccion_fotos.csv (https://usuario:clave@dominio/fotos/...).")
+    if origen.startswith("http"):
+        r = requests.get(origen, timeout=300)          # requests toma usuario:clave de la URL
+        r.raise_for_status()
+        SELECCION_CSV.write_bytes(r.content)
+        texto = r.content.decode("utf-8-sig")
+    else:
+        texto = Path(origen).read_text("utf-8-sig")
+    filas = list(csv.DictReader(texto.splitlines(), delimiter=";"))
+    por_op = {}
+    for f in filas:
+        por_op.setdefault(f["oportunidad_id"], []).append(f)
+    if args.piloto:
+        ops = _piloto(por_op, args.piloto)
+        filas = [f for o in ops for f in por_op[o]]
+        print(f"Piloto: {len(ops)} oportunidades")
+        for o in ops:
+            fs = por_op[o]
+            print(f"  {len(fs):4d} fotos · {len({f['ciudad'] for f in fs if f['ciudad']}):3d} ciudades · "
+                  f"{fs[0].get('anio') or '----'} · {fs[0]['oportunidad'][:70]}")
+    fotos = []
+    for f in filas:
+        cliente = (f.get("cliente") or f["oportunidad"]).strip()
+        anio = (f.get("anio") or "").strip()
+        base = f"{anio}/{cliente}" if anio else cliente           # campana_de() → "2023/Cliente"
+        ruta = f"{base}/{f['oportunidad']}/{f['ruta']}".strip("/")
+        fotos.append({"id": f["file_id"], "nombre": f["nombre"], "ruta": ruta, "rutas": [ruta], "ids": [f["file_id"]],
+                      "tamano": int(float(f.get("kb") or 0) * 1024), "sha1": f.get("sha1"),
+                      "oportunidad_id": f["oportunidad_id"], "oportunidad": f["oportunidad"], "cliente": cliente,
+                      "anio": anio, "ciudad": f.get("ciudad", ""), "situacion": f.get("situacion", "")})
+    escribir_json(MANIFEST, fotos)
+    print(f"Manifest: {len(fotos)} fotos de {len({f['oportunidad_id'] for f in fotos})} oportunidades · "
+          f"{sum(1 for f in fotos if f['ciudad'])} con ciudad · coste orientativo con Haiku ≈ {len(fotos) * 0.00045:.2f} $")
+
+
+def contexto_oportunidad(foto):
+    """Lo que la IA no puede ver en la foto: de qué campaña es y dónde se hizo."""
+    if not foto.get("oportunidad_id"):
+        return ""
+    t = f"\nCampaña (oportunidad): {foto['oportunidad']}\nCliente: {foto['cliente']}"
+    if foto.get("anio"):
+        t += f"\nAño: {foto['anio']}"
+    if foto.get("ciudad"):
+        t += f"\nCiudad de la parada: {foto['ciudad']}"
+    return t
+
+
 def cmd_enviar(args):
     fotos = leer_json(MANIFEST)
     if not fotos:
@@ -540,6 +606,7 @@ def cmd_enviar(args):
                 texto = f"Archivo: {foto['nombre']}"
                 if INCLUIR_RUTA and any(rutas(foto)):
                     texto += "\nCarpeta: " + " | ".join(r for r in rutas(foto) if r)
+                texto += contexto_oportunidad(foto)
                 contenido = refs + [{"type": "text", "text": "FOTO A CATALOGAR:"},
                                     bloque_imagen(miniatura(foto["id"])), {"type": "text", "text": texto}]
                 # tool_choice "auto": algunos modelos (p. ej. Sonnet 5.5) no aceptan forzar la herramienta.
@@ -642,7 +709,8 @@ def cmd_recoger(_args):
     if any(b.processing_status != "ended" for b in st.values()):
         sys.exit("Todavía hay lotes en curso. Vuelve a probar más tarde.")
 
-    campos = ["file_id", "nombre", "carpetas", "campana", "cliente_carpeta", "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
+    campos = ["file_id", "nombre", "carpetas", "campana", "cliente_carpeta", "oportunidad_id", "oportunidad", "ciudad",
+              "enlace_box", "modelo", "vehiculo", "tipo_vehiculo", "plano",
               "linea_principal", "lineas_servicio", "marca_visible", "fuente_marca", "personas",
               "posibles_menores", "calidad", "apta_propuesta", "descripcion", "palabras_clave", "confianza",
               "fuera_de_lista", "incompleta", "fin", "marca_en_carpeta", "uso_autorizado", "coste_usd", "version", "revision_ok", "notas_revision"]
@@ -693,8 +761,10 @@ def cmd_recoger(_args):
             fila = {
                 "file_id": file_id, "nombre": foto["nombre"],
                 "carpetas": " | ".join(x or "(raíz)" for x in rutas(foto)),
-                "cliente_carpeta": cliente_de(primera) if INCLUIR_RUTA else "",
+                "cliente_carpeta": foto.get("cliente") or (cliente_de(primera) if INCLUIR_RUTA else ""),
                 "campana": campana_de(primera),
+                "oportunidad_id": foto.get("oportunidad_id", ""), "oportunidad": foto.get("oportunidad", ""),
+                "ciudad": foto.get("ciudad", ""),
                 "enlace_box": f"https://app.box.com/file/{file_id}", "modelo": modelo,
                 **{k: ficha.get(k, "") for k in PROPS},
                 "linea_principal": lineas[0] if lineas else "",
@@ -1061,7 +1131,9 @@ def cmd_indice(args):
                 "menores": f.get("posibles_menores", ""), "calidad": f.get("calidad", ""),
                 "apta": f.get("apta_propuesta") == "True", "uso": f.get("uso_autorizado", ""),
                 "descripcion": f.get("descripcion", ""),
-                "palabras": [x.strip() for x in (f.get("palabras_clave") or "").split(",") if x.strip()],
+                "palabras": [x.strip() for x in (f.get("palabras_clave") or "").split(",") if x.strip()]
+                            + [x for x in (f.get("ciudad", ""), f.get("oportunidad", "")) if x],
+                "ciudad": f.get("ciudad", ""), "oportunidad_id": f.get("oportunidad_id", ""),
                 "tanda": d.name, "_rango": rango,
             }
             usadas += 1
@@ -1100,7 +1172,7 @@ def cmd_todo(args):
 def main():
     p = argparse.ArgumentParser(description="Piloto de etiquetado de fotos de Box con Claude")
     p.add_argument("comando", choices=["listar", "enviar", "estado", "recoger", "todo", "flota", "flota-recoger",
-                                          "indice"])
+                                          "indice", "importar"])
     p.add_argument("--si", action="store_true", help="no pedir confirmación antes de enviar")
     p.add_argument("--forzar", action="store_true", help="sustituir el lote de los modelos indicados")
     p.add_argument("--modelos", help="modelos a enviar, separados por comas (por defecto, MODELOS)")
@@ -1110,11 +1182,13 @@ def main():
                                     "(p. ej. /app/datos/archivo,/app/datos)")
     p.add_argument("--solo-incompletas", action="store_true",
                    help="con enviar/todo: repite solo las fotos con ficha incompleta o error y las fusiona")
+    p.add_argument("--csv", help="con importar: ruta o URL de seleccion_fotos.csv (o SELECCION_URL)")
+    p.add_argument("--piloto", type=int, help="con importar: solo N oportunidades variadas")
     args = p.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
     {"listar": cmd_listar, "enviar": cmd_enviar, "estado": cmd_estado, "recoger": cmd_recoger,
      "todo": cmd_todo, "flota": cmd_flota, "flota-recoger": cmd_flota_recoger,
-     "indice": cmd_indice}[args.comando](args)
+     "indice": cmd_indice, "importar": cmd_importar}[args.comando](args)
 
 
 if __name__ == "__main__":

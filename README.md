@@ -84,6 +84,18 @@ python etiquetar.py flota --revisar 13,80   # vuelve a consultar solo las campa�
 Genera `flota_campanas.csv` (una fila por campaña, con columnas para confirmar) y
 `resultados_flota.csv` (cada foto con el vehículo de su campaña).
 
+### Fotos de las oportunidades (selección de box-oportunidades)
+`fotos.py seleccionar` (en box-oportunidades) elige qué fotos de las oportunidades faltan en el archivo. Aquí se
+importan en su propia tanda, con oportunidad, cliente, año y ciudad (van a la IA y al índice):
+```bash
+export DATA_DIR=/app/datos/oportunidades MODELOS=claude-haiku-5-5 INCLUIR_RUTA=true
+mkdir -p $DATA_DIR
+python etiquetar.py importar --csv "http://alegria:<DESCARGA_PASSWORD de oportunidades>@tools_oportunidades:8080/fotos/seleccion_fotos.csv" --piloto 10
+setsid nohup python etiquetar.py todo --si > $DATA_DIR/log.txt 2>&1 < /dev/null &
+```
+Sin `--piloto` importa toda la selección; `todo` reanuda y no repite las fotos ya enviadas en el piloto.
+Para el buscador, añade `/app/datos/oportunidades` a `--tandas` al regenerar el índice.
+
 ### Índice para el buscador del conector de Box
 ```bash
 DATA_DIR=/app/datos python etiquetar.py indice --tandas /app/datos/archivo,/app/datos
