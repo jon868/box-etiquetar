@@ -1171,6 +1171,148 @@ def cmd_indice(args):
     print(f"Índice: {salida} · {len(datos)} fotos · {salida.stat().st_size / 1e6:.1f} MB")
 
 
+# ---------------------------------------------------------------- nocturno: fotos nuevas cada noche
+ARCHIVO_CARPETAS = [x.strip() for x in os.getenv("ARCHIVO_CARPETAS", "6895313990,379464633435,302472928787").split(",")
+                    if x.strip()]
+TANDAS_BASE = [x.strip() for x in os.getenv("INDICE_TANDAS", "archivo,2025,.,oportunidades").split(",") if x.strip()]
+NOCTURNO_MAX = int(os.getenv("NOCTURNO_MAX", "3000"))      # por encima no envía nada (para no llevarse sorpresas)
+
+
+def _tandas_todas(base):
+    fijas = [(base / t).resolve() for t in TANDAS_BASE]
+    noches = sorted(p for p in (base / "noche").glob("*") if p.is_dir()) if (base / "noche").exists() else []
+    return [d for d in fijas + noches if d.exists()]
+
+
+def _ya_conocidas(tandas):
+    """file_id y SHA1 de lo ya etiquetado o enviado a la IA (no basta con estar en un manifest: si una noche falla
+    antes de enviar, esas fotos se vuelven a intentar), y cuántas fotos etiquetadas lleva cada oportunidad."""
+    ids, por_op = set(), {}
+    for d in tandas:
+        for v in (leer_json(d / "enviadas.json", {}) or {}).values():
+            ids.update(v)
+        res = d / "resultados.csv"
+        if res.exists():
+            with res.open(encoding="utf-8-sig") as fh:
+                for r in csv.DictReader(fh):
+                    ids.add(r["file_id"])
+                    if r.get("oportunidad_id"):
+                        por_op.setdefault(r["oportunidad_id"], set()).add(r["file_id"])
+    shas = set()
+    for d in tandas:
+        for f in leer_json(d / "manifest.json", []) or []:
+            if f.get("sha1") and any(i in ids for i in (f.get("ids") or [f["id"]])):
+                shas.add(f["sha1"])
+                ids.update(f.get("ids") or [])
+    return ids, shas, Counter({op: len(v) for op, v in por_op.items()})
+
+
+def _nuevas_del_archivo(ids, shas):
+    salida = []
+    for raiz in ARCHIVO_CARPETAS:
+        archivos = []
+        listar_carpeta(raiz, "", archivos)
+        print(f"  archivo {raiz}: {len(archivos)} imágenes", flush=True)
+        salida += archivos
+    unicas = {}
+    for f in salida:
+        if f["id"] in ids or (f.get("sha1") and f["sha1"] in shas):
+            continue
+        clave = f.get("sha1") or f["id"]
+        if clave in unicas:
+            unicas[clave]["rutas"].append(f["ruta"])
+            unicas[clave]["ids"].append(f["id"])
+        else:
+            unicas[clave] = {**f, "rutas": [f["ruta"]], "ids": [f["id"]]}
+    return list(unicas.values())
+
+
+def _nuevas_de_oportunidades(ids, shas, por_oportunidad):
+    url = os.getenv("SELECCION_URL", "")
+    if not url:
+        print("  oportunidades: sin SELECCION_URL, me las salto")
+        return []
+    r = requests.get(url, timeout=300)
+    r.raise_for_status()
+    filas = list(csv.DictReader(r.content.decode("utf-8-sig").splitlines(), delimiter=";"))
+    por_op = {}
+    for f in filas:
+        por_op.setdefault(f["oportunidad_id"], []).append(f)
+    salida = []
+    for op, fs in por_op.items():
+        # La selección puede moverse un poco al llegar fotos nuevas: se completa solo hasta su cupo actual
+        falta = len(fs) - por_oportunidad[op]
+        for f in fs:
+            if falta <= 0:
+                break
+            if f["file_id"] in ids or (f.get("sha1") and f["sha1"] in shas):
+                continue
+            cliente = (f.get("cliente") or f["oportunidad"]).strip()
+            anio = (f.get("anio") or "").strip()
+            base = f"{anio}/{cliente}" if anio else cliente
+            ruta = f"{base}/{f['oportunidad']}/{f['ruta']}".strip("/")
+            salida.append({"id": f["file_id"], "nombre": f["nombre"], "ruta": ruta, "rutas": [ruta],
+                           "ids": [f["file_id"]], "tamano": int(float(f.get("kb") or 0) * 1024), "sha1": f.get("sha1"),
+                           "oportunidad_id": op, "oportunidad": f["oportunidad"], "cliente": cliente, "anio": anio,
+                           "ciudad": f.get("ciudad", ""), "situacion": f.get("situacion", "")})
+            falta -= 1
+    print(f"  oportunidades: {len(filas)} seleccionadas en {len(por_op)} oportunidades · nuevas: {len(salida)}")
+    return salida
+
+
+def cmd_nocturno(args):
+    """Busca fotos nuevas en el archivo y en la selección de las oportunidades, las etiqueta en una tanda del día
+    (datos/noche/AAAAMMDD) y regenera el índice con todas las tandas."""
+    import fcntl
+    import subprocess
+    base = DATA
+    cerrojo = (base / ".nocturno.lock").open("w")
+    try:
+        fcntl.flock(cerrojo, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("Ya hay un etiquetado nocturno en marcha.")
+    print(f"=== Etiquetado nocturno {time.strftime('%Y-%m-%d %H:%M')} ===", flush=True)
+    yo = str(Path(__file__).resolve())
+    # Noches anteriores que enviaron lotes pero no llegaron a recogerlos: se terminan primero
+    for d in sorted((base / "noche").glob("*")) if (base / "noche").exists() else []:
+        if (d / "lotes.json").exists() and not (d / "resultados.csv").exists():
+            print(f"Terminando la tanda pendiente {d}", flush=True)
+            subprocess.run([sys.executable, yo, "todo", "--si"], check=False,
+                           env={**os.environ, "DATA_DIR": str(d), "INCLUIR_RUTA": "true",
+                                "MODELOS": os.getenv("MODELO_NOCTURNO", "claude-haiku-5-5")})
+    ids, shas, por_oportunidad = _ya_conocidas(_tandas_todas(base))
+    print(f"Ya etiquetadas o enviadas: {len(ids)} archivos", flush=True)
+    nuevas = _nuevas_del_archivo(ids, shas)
+    print(f"  archivo: {len(nuevas)} fotos nuevas", flush=True)
+    vistas = {f["id"] for f in nuevas} | {f.get("sha1") for f in nuevas if f.get("sha1")}
+    nuevas += [f for f in _nuevas_de_oportunidades(ids, shas, por_oportunidad)
+               if f["id"] not in vistas and f.get("sha1") not in vistas]
+    if not nuevas:
+        print("No hay fotos nuevas. Fin.")
+        return
+    if len(nuevas) > NOCTURNO_MAX and not args.si:
+        print(f"⚠ {len(nuevas)} fotos nuevas: más de NOCTURNO_MAX={NOCTURNO_MAX}. No envío nada. "
+              f"Para hacerlo a mano: python etiquetar.py nocturno --si")
+        return
+    tanda = base / "noche" / time.strftime("%Y%m%d")
+    tanda.mkdir(parents=True, exist_ok=True)
+    previas = leer_json(tanda / "manifest.json", []) or []
+    escribir_json(tanda / "manifest.json", previas + nuevas)
+    print(f"Tanda {tanda}: {len(nuevas)} fotos · coste orientativo ≈ {len(nuevas) * 0.00045:.2f} $", flush=True)
+    entorno_t = {**os.environ, "DATA_DIR": str(tanda), "MODELOS": os.getenv("MODELO_NOCTURNO", "claude-haiku-5-5"),
+                 "INCLUIR_RUTA": "true", "MAX_FOTOS": "1000000"}
+    r = subprocess.run([sys.executable, yo, "todo", "--si"], env=entorno_t, check=False)
+    if r.returncode != 0:
+        sys.exit("El etiquetado de la tanda ha fallado; el índice no se toca. Mañana se reintenta lo que falte.")
+    indice = base / "indice.json"
+    if indice.exists():
+        (base / "indice_anterior.json").write_bytes(indice.read_bytes())
+    tandas = ",".join(str(d) for d in _tandas_todas(base))
+    r = subprocess.run([sys.executable, yo, "indice", "--tandas", tandas], env={**os.environ, "DATA_DIR": str(base)},
+                       check=False)
+    print("=== Fin ===" if r.returncode == 0 else "⚠ El índice ha fallado: sigue el anterior.", flush=True)
+
+
 def cmd_todo(args):
     if not MANIFEST.exists():
         cmd_listar(args)
@@ -1198,7 +1340,7 @@ def cmd_todo(args):
 def main():
     p = argparse.ArgumentParser(description="Piloto de etiquetado de fotos de Box con Claude")
     p.add_argument("comando", choices=["listar", "enviar", "estado", "recoger", "todo", "flota", "flota-recoger",
-                                          "indice", "importar"])
+                                          "indice", "importar", "nocturno"])
     p.add_argument("--si", action="store_true", help="no pedir confirmación antes de enviar")
     p.add_argument("--forzar", action="store_true", help="sustituir el lote de los modelos indicados")
     p.add_argument("--modelos", help="modelos a enviar, separados por comas (por defecto, MODELOS)")
@@ -1214,7 +1356,8 @@ def main():
     DATA.mkdir(parents=True, exist_ok=True)
     {"listar": cmd_listar, "enviar": cmd_enviar, "estado": cmd_estado, "recoger": cmd_recoger,
      "todo": cmd_todo, "flota": cmd_flota, "flota-recoger": cmd_flota_recoger,
-     "indice": cmd_indice, "importar": cmd_importar}[args.comando](args)
+     "indice": cmd_indice, "importar": cmd_importar,
+     "nocturno": cmd_nocturno}[args.comando](args)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,12 @@ Solo sirve resultados.csv y resultados.jsonl; nunca las miniaturas ni el .env.
 import base64
 import hmac
 import os
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -14,6 +20,13 @@ DATA = Path(os.getenv("DATA_DIR", "datos"))
 USUARIO = os.getenv("DESCARGA_USUARIO", "alegria")
 PASSWORD = os.getenv("DESCARGA_PASSWORD", "")
 PUERTO = int(os.getenv("PORT", "8080"))
+# Etiquetado nocturno de fotos nuevas (python etiquetar.py nocturno). Después de la actualización de box-oportunidades
+# (03:00), que rehace la selección de fotos. Se desactiva con NOCTURNO=no.
+NOCTURNO = os.getenv("NOCTURNO", "si").lower() not in ("no", "0", "false") and bool(os.getenv("ANTHROPIC_API_KEY"))
+HORA = os.getenv("NOCTURNO_HORA", "05:30")
+ZONA = ZoneInfo(os.getenv("NOCTURNO_ZONA", "Europe/Madrid"))
+LOG_NOCHE = DATA / "noche" / "log.txt"
+ULTIMA = DATA / ".ultimo_nocturno"
 
 TIPOS = {"resultados.csv": "text/csv; charset=utf-8",
          "flota_campanas.csv": "text/csv; charset=utf-8",
@@ -82,7 +95,37 @@ class Manejador(BaseHTTPRequestHandler):
         self._texto(404, "No encontrado")
 
 
+def programador():
+    """Cada medio minuto mira la hora; a NOCTURNO_HORA lanza el etiquetado nocturno una vez al día."""
+    while True:
+        try:
+            ahora = datetime.now(ZONA)
+            hoy = ahora.strftime("%Y-%m-%d")
+            hecha = ULTIMA.read_text().strip() if ULTIMA.exists() else ""
+            if ahora.strftime("%H:%M") >= HORA and hecha != hoy:
+                ULTIMA.write_text(hoy)
+                LOG_NOCHE.parent.mkdir(parents=True, exist_ok=True)
+                if LOG_NOCHE.exists() and LOG_NOCHE.stat().st_size > 5_000_000:
+                    LOG_NOCHE.write_bytes(LOG_NOCHE.read_bytes()[-2_000_000:])
+                with LOG_NOCHE.open("a", encoding="utf-8") as log:
+                    log.write(f"\n--- lanzado {ahora:%Y-%m-%d %H:%M} ({ZONA.key}) ---\n")
+                    log.flush()
+                    subprocess.run([sys.executable, "etiquetar.py", "nocturno"], stdout=log, stderr=subprocess.STDOUT,
+                                   cwd=Path(__file__).parent, check=False,
+                                   env={**os.environ, "DATA_DIR": str(DATA), "PYTHONUNBUFFERED": "1"})
+        except Exception as e:  # noqa: BLE001 — el programador no debe tumbar el servidor
+            print(f"[nocturno] error: {e}", flush=True)
+        time.sleep(30)
+
+
 if __name__ == "__main__":
     DATA.mkdir(parents=True, exist_ok=True)
     print(f"Servidor de descargas en el puerto {PUERTO}")
+    if NOCTURNO:
+        if not ULTIMA.exists():   # recién instalado: el primero, esta noche
+            ULTIMA.write_text(datetime.now(ZONA).strftime("%Y-%m-%d"))
+        threading.Thread(target=programador, daemon=True).start()
+        print(f"Etiquetado nocturno cada día a las {HORA} ({ZONA.key})")
+    else:
+        print("Etiquetado nocturno desactivado (NOCTURNO=no o falta ANTHROPIC_API_KEY)")
     ThreadingHTTPServer(("0.0.0.0", PUERTO), Manejador).serve_forever()

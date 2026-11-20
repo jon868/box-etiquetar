@@ -3,3 +3,4 @@ requests>=2.31
 pillow>=10.0
 pillow-heif>=0.16
 python-dotenv>=1.0
+tzdata>=2024.1

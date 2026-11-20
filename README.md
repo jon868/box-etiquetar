@@ -96,6 +96,17 @@ setsid nohup python etiquetar.py todo --si > $DATA_DIR/log.txt 2>&1 < /dev/null 
 Sin `--piloto` importa toda la selección; `todo` reanuda y no repite las fotos ya enviadas en el piloto.
 Para el buscador, añade `/app/datos/oportunidades` a `--tandas` al regenerar el índice.
 
+### Etiquetado nocturno (automático)
+Cada día a las `NOCTURNO_HORA` (05:30, Europe/Madrid) el servidor lanza `python etiquetar.py nocturno`:
+1. Lista el archivo de fotos (`ARCHIVO_CARPETAS`) y descarga la selección de las oportunidades (`SELECCION_URL`,
+   que box-oportunidades rehace cada noche a las 03:00).
+2. Se queda con las fotos que no están etiquetadas (por id y SHA1). En las oportunidades completa cada una solo hasta
+   su cupo, para no ir sumando fotos si la selección se mueve.
+3. Las etiqueta con Haiku en la tanda del día, `datos/noche/AAAAMMDD`, y regenera `indice.json` con todas las tandas
+   (`INDICE_TANDAS` más las de `noche/`). Copia el anterior en `indice_anterior.json`.
+- Si hay más de `NOCTURNO_MAX` (3000) fotos nuevas no envía nada y lo deja en el log (a mano: `nocturno --si`).
+- Log: `https://<dominio>/noche/log.txt`. Se desactiva con `NOCTURNO=no`. No redespliegues hacia las 05:30.
+
 ### Índice para el buscador del conector de Box
 ```bash
 DATA_DIR=/app/datos python etiquetar.py indice --tandas /app/datos/archivo,/app/datos
