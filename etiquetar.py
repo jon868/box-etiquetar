@@ -23,8 +23,10 @@ import csv
 import io
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1097,6 +1099,26 @@ def vehiculo_foto(f):
     return v
 
 
+# Carpetas de documentación (no fotos de campaña) que no entran en el buscador: carteles de prensa, gestiones del viaje…
+INDICE_EXCLUIR = [x.strip() for x in os.getenv(
+    "INDICE_EXCLUIR_CARPETAS",
+    "prensa,alojamiento,alojamientos,vuelo,vuelos,hotel,hoteles,reserva,reservas,factura,facturas,billete,billetes"
+).split(",") if x.strip()]
+
+
+def excluir_del_indice(f):
+    """Las fotos de oportunidades cuya ruta (dentro de la oportunidad) pasa por una carpeta de INDICE_EXCLUIR."""
+    if not f.get("oportunidad_id"):
+        return False
+    dentro = f["carpetas"].split(" | ")[0].split("/")[3:]        # quita año/cliente/oportunidad
+    palabras = {normal(p) for p in INDICE_EXCLUIR}
+    for seg in dentro:
+        trozos = re.split(r"[^a-z0-9]+", unicodedata.normalize("NFKD", seg).encode("ascii", "ignore").decode().lower())
+        if any(t in palabras for t in trozos if t):
+            return True
+    return False
+
+
 def cmd_indice(args):
     """Junta los resultados de varias tandas en un indice.json para la herramienta buscar_fotos."""
     tandas = [Path(x.strip()) for x in (args.tandas or str(DATA)).split(",") if x.strip()]
@@ -1110,8 +1132,11 @@ def cmd_indice(args):
             continue
         with archivo.open(encoding="utf-8-sig") as fh:
             filas = list(csv.DictReader(fh))
-        usadas = 0
+        usadas = excluidas = 0
         for f in filas:
+            if excluir_del_indice(f):
+                excluidas += 1
+                continue
             fid = f["file_id"]
             rango = preferencia.index(f["modelo"]) if f.get("modelo") in preferencia else 9
             previo = registros.get(fid)
@@ -1137,7 +1162,8 @@ def cmd_indice(args):
                 "tanda": d.name, "_rango": rango,
             }
             usadas += 1
-        print(f"  {d}: {len(filas)} fichas leídas, {usadas} añadidas o mejoradas")
+        print(f"  {d}: {len(filas)} fichas leídas, {usadas} añadidas o mejoradas"
+              + (f", {excluidas} fuera (prensa, alojamientos, vuelos…)" if excluidas else ""))
     datos = [{k: v for k, v in r.items() if not k.startswith("_")} for r in registros.values()]
     salida.parent.mkdir(parents=True, exist_ok=True)
     salida.write_text(json.dumps({"version": VERSION, "generado": time.strftime("%Y-%m-%d %H:%M"),
