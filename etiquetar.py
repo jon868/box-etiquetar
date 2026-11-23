@@ -1198,6 +1198,8 @@ def _ya_conocidas(tandas):
                     ids.add(r["file_id"])
                     if r.get("oportunidad_id"):
                         por_op.setdefault(r["oportunidad_id"], set()).add(r["file_id"])
+    # Fotos que no se pueden abrir (dañadas, temporales de Office…): no se reintentan cada noche
+    ids.update(leer_json(DATA / "noche" / "descartadas.json", []) or [])
     shas = set()
     for d in tandas:
         for f in leer_json(d / "manifest.json", []) or []:
@@ -1302,6 +1304,15 @@ def cmd_nocturno(args):
     entorno_t = {**os.environ, "DATA_DIR": str(tanda), "MODELOS": os.getenv("MODELO_NOCTURNO", "claude-haiku-5-5"),
                  "INCLUIR_RUTA": "true", "MAX_FOTOS": "1000000"}
     r = subprocess.run([sys.executable, yo, "todo", "--si"], env=entorno_t, check=False)
+    enviadas = {i for v in (leer_json(tanda / "enviadas.json", {}) or {}).values() for i in v}
+    fallidas = [f["id"] for f in nuevas if f["id"] not in enviadas]
+    if fallidas:   # no se han podido preparar: se apuntan para no reintentarlas cada noche
+        lista = base / "noche" / "descartadas.json"
+        escribir_json(lista, sorted(set(leer_json(lista, []) or []) | set(fallidas)))
+        print(f"{len(fallidas)} fotos no se han podido abrir: apuntadas en {lista} y no se reintentan.", flush=True)
+    if not enviadas:
+        print("No se ha enviado nada en esta tanda; el índice no cambia. Fin.", flush=True)
+        return
     if r.returncode != 0:
         sys.exit("El etiquetado de la tanda ha fallado; el índice no se toca. Mañana se reintenta lo que falte.")
     indice = base / "indice.json"
