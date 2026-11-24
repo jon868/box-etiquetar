@@ -4,7 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY etiquetar.py servidor.py ./
+COPY etiquetar.py servidor.py ajustes_vehiculo.csv ./
 
 ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/app/datos \

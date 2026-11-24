@@ -117,6 +117,11 @@ Con `--todas` etiqueta también las fotos de la carpeta que aún no lo estaban (
 oportunidad de una ya etiquetada); con `--forzar` repite una corrección del mismo día. Enseña el coste y pide confirmación. Crea la tanda `datos/correcciones/AAAAMMDD-<carpeta>`, que en el índice gana
 a las fichas anteriores de esas fotos, y el nocturno la sigue incluyendo al regenerar el índice.
 
+### Ajustes a mano del vehículo
+`ajustes_vehiculo.csv` (en el repositorio, separado por `;`: `file_id;vehiculo;motivo`) corrige el vehículo de fotos
+concretas cuando la IA se equivoca. Gana a la IA en el índice. Tras editarlo: commit, redespliegue y regenerar el índice
+(o esperar al nocturno).
+
 ### Índice para el buscador del conector de Box
 ```bash
 DATA_DIR=/app/datos python etiquetar.py indice --tandas /app/datos/archivo,/app/datos

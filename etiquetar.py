@@ -1127,6 +1127,21 @@ def excluir_del_indice(f):
     return False
 
 
+AJUSTES_VEHICULO = Path(os.getenv("AJUSTES_VEHICULO", str(Path(__file__).resolve().parent / "ajustes_vehiculo.csv")))
+
+
+def leer_ajustes_vehiculo():
+    """Correcciones a mano del vehículo de fotos concretas (file_id;vehiculo;motivo). Ganan a la IA en el índice."""
+    if not AJUSTES_VEHICULO.exists():
+        return {}
+    with AJUSTES_VEHICULO.open(encoding="utf-8-sig") as fh:
+        filas = list(csv.DictReader(fh, delimiter=";"))
+    malas = [r for r in filas if r.get("vehiculo", "").strip() not in FLOTA + ["otro vehículo", "sin vehículo"]]
+    if malas:
+        print(f"  ⚠ {AJUSTES_VEHICULO.name}: {len(malas)} filas con un vehículo que no es de la lista, las ignoro")
+    return {r["file_id"].strip(): r["vehiculo"].strip() for r in filas if r not in malas and r.get("file_id")}
+
+
 def cmd_indice(args):
     """Junta los resultados de varias tandas en un indice.json para la herramienta buscar_fotos."""
     tandas = [Path(x.strip()) for x in (args.tandas or str(DATA)).split(",") if x.strip()]
@@ -1172,6 +1187,16 @@ def cmd_indice(args):
             usadas += 1
         print(f"  {d}: {len(filas)} fichas leídas, {usadas} añadidas o mejoradas"
               + (f", {excluidas} fuera (prensa, alojamientos, vuelos…)" if excluidas else ""))
+    ajustes = leer_ajustes_vehiculo()
+    aplicados = 0
+    for fid, veh in ajustes.items():
+        if fid in registros:
+            registros[fid]["vehiculo"] = veh
+            if registros[fid].get("vehiculo_campana") and veh not in vehiculos_de(registros[fid]["vehiculo_campana"]):
+                registros[fid]["vehiculo_campana"] = ""
+            aplicados += 1
+    if ajustes:
+        print(f"  Ajustes a mano de vehículo ({AJUSTES_VEHICULO.name}): {aplicados} de {len(ajustes)} aplicados")
     datos = [{k: v for k, v in r.items() if not k.startswith("_")} for r in registros.values()]
     salida.parent.mkdir(parents=True, exist_ok=True)
     salida.write_text(json.dumps({"version": VERSION, "generado": time.strftime("%Y-%m-%d %H:%M"),
