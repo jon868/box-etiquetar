@@ -98,9 +98,10 @@ REFERENCIAS = [
     ("CajaMar", "2400551454784", "camión carrozado con escalera y rampa de acceso lateral"),
     ("Plataformas", "2400244907579", "módulo-remolque blanco grande tipo sala, con ventanas"),
     ("Set TV", "2400249995707", "módulo plató de TV con terraza superior"),
-    ("Cotazero", "2554417078817", "módulo prismático de cantos redondeados, a ras de suelo (cota cero), con un "
-                                  "lateral liso y largo; NO es la Airstream, que es una caravana corta de aluminio"),
-    ("Cotazero", "2554416174582", "el mismo Cotazero: a la derecha, pared lateral acristalada con puerta automática"),
+    ("Cotazero", "2611953685657", "unidad modular prismática de cantos redondeados, a ras de suelo (cota cero), sin "
+                                  "ruedas ni cabina a la vista, con un módulo más pequeño adosado en un extremo; NO es "
+                                  "la Airstream, que es una caravana corta de aluminio"),
+    ("Cotazero", "2611945211521", "el mismo Cotazero de lado: pared lateral larga con puerta automática acristalada"),
 ]
 
 LINEAS = ["Roadshow", "Acciones pedagógicas y sensibilización", "Marca y patrocinio",
