@@ -15,7 +15,8 @@ Uso:
   python etiquetar.py flota-recoger          Recoge esa consulta: flota_campanas.csv y resultados_flota.csv
   python etiquetar.py indice --tandas a,b    Junta tandas en indice.json para el buscador del conector de Box
   python etiquetar.py corregir --carpeta ID  Vuelve a etiquetar con Sonnet las fotos ya etiquetadas de esa carpeta
-         [--si]                              de Box (p. ej. al añadir una referencia de flota) y regenera el índice
+         [--todas] [--forzar] [--si]         de Box (p. ej. al añadir una referencia de flota) y regenera el índice;
+                                             con --todas, también las de la carpeta que aún no estaban etiquetadas
 
 Solo LEE de Box. No escribe, mueve ni borra nada allí.
 """
@@ -1356,9 +1357,24 @@ def cmd_corregir(args):
             if any(i in ids for i in (f.get("ids") or [f["id"]])) or (f.get("sha1") and f["sha1"] in shas):
                 elegidas.setdefault(f.get("sha1") or f["id"], f)
     if not elegidas:
-        sys.exit("Ninguna foto de esa carpeta está etiquetada todavía: no hay nada que corregir.")
-    print(f"Ya etiquetadas: {len(elegidas)} · sin etiquetar (las coge el nocturno): "
-          f"{len(archivos) - sum(1 for f in archivos if f['id'] in {i for e in elegidas.values() for i in (e.get('ids') or [e['id']])})}")
+        sys.exit("Ninguna foto de esa carpeta está etiquetada todavía: no hay ficha de la que sacar cliente, año y "
+                 "oportunidad. Etiquétala antes con 'importar' o desde el archivo.")
+    conocidas = {i for e in elegidas.values() for i in (e.get("ids") or [e["id"]])} | \
+                {e["sha1"] for e in elegidas.values() if e.get("sha1")}
+    nuevas = [f for f in archivos if f["id"] not in conocidas and f.get("sha1") not in conocidas]
+    print(f"Ya etiquetadas: {len(elegidas)} · sin etiquetar: {len(nuevas)}"
+          + ("" if args.todas else " (no entran; añade --todas para etiquetarlas también)"))
+    if args.todas and nuevas:
+        # Las nuevas heredan cliente, año, oportunidad y ruta de una ficha ya etiquetada de la misma carpeta.
+        plantilla = next(iter(elegidas.values()))
+        base_ruta = (plantilla.get("rutas") or [plantilla["ruta"]])[0]
+        for f in nuevas:
+            elegidas.setdefault(f.get("sha1") or f["id"], {
+                **{k: v for k, v in plantilla.items() if k not in ("id", "ids", "nombre", "tamano", "sha1", "rutas",
+                                                                  "ruta")},
+                "id": f["id"], "ids": [f["id"]], "nombre": f["nombre"], "tamano": f.get("tamano", 0),
+                "sha1": f.get("sha1"), "ruta": "/".join(x for x in (base_ruta, f["ruta"]) if x),
+                "rutas": ["/".join(x for x in (base_ruta, f["ruta"]) if x)]})
     tanda = base / "correcciones" / f"{time.strftime('%Y%m%d')}-{args.carpeta}"
     if (tanda / "resultados.csv").exists() and not args.forzar:
         sys.exit(f"{tanda} ya tiene resultados (usa --forzar para repetirla).")
@@ -1419,6 +1435,8 @@ def main():
     p.add_argument("--csv", help="con importar: ruta o URL de seleccion_fotos.csv (o SELECCION_URL)")
     p.add_argument("--piloto", type=int, help="con importar: solo N oportunidades variadas")
     p.add_argument("--carpeta", help="con corregir: id de la carpeta de Box cuyas fotos se vuelven a etiquetar")
+    p.add_argument("--todas", action="store_true",
+                   help="con corregir: etiqueta también las fotos de la carpeta que aún no lo estaban")
     args = p.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
     {"listar": cmd_listar, "enviar": cmd_enviar, "estado": cmd_estado, "recoger": cmd_recoger,

@@ -113,7 +113,8 @@ Sonnet y regenera el índice:
 ```bash
 DATA_DIR=/app/datos python etiquetar.py corregir --carpeta <id de la carpeta de Box>
 ```
-Enseña el coste y pide confirmación. Crea la tanda `datos/correcciones/AAAAMMDD-<carpeta>`, que en el índice gana
+Con `--todas` etiqueta también las fotos de la carpeta que aún no lo estaban (heredan cliente, año y
+oportunidad de una ya etiquetada); con `--forzar` repite una corrección del mismo día. Enseña el coste y pide confirmación. Crea la tanda `datos/correcciones/AAAAMMDD-<carpeta>`, que en el índice gana
 a las fichas anteriores de esas fotos, y el nocturno la sigue incluyendo al regenerar el índice.
 
 ### Índice para el buscador del conector de Box
