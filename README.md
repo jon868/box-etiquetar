@@ -107,6 +107,15 @@ Cada día a las `NOCTURNO_HORA` (05:30, Europe/Madrid) el servidor lanza `python
 - Si hay más de `NOCTURNO_MAX` (3000) fotos nuevas no envía nada y lo deja en el log (a mano: `nocturno --si`).
 - Log: `https://<dominio>/noche/log.txt`. Se desactiva con `NOCTURNO=no`. No redespliegues hacia las 05:30.
 
+### Corregir una carpeta ya etiquetada
+Si cambia algo que afecta a fotos ya etiquetadas (p. ej. una referencia nueva de flota), vuelve a etiquetarlas con
+Sonnet y regenera el índice:
+```bash
+DATA_DIR=/app/datos python etiquetar.py corregir --carpeta <id de la carpeta de Box>
+```
+Enseña el coste y pide confirmación. Crea la tanda `datos/correcciones/AAAAMMDD-<carpeta>`, que en el índice gana
+a las fichas anteriores de esas fotos, y el nocturno la sigue incluyendo al regenerar el índice.
+
 ### Índice para el buscador del conector de Box
 ```bash
 DATA_DIR=/app/datos python etiquetar.py indice --tandas /app/datos/archivo,/app/datos

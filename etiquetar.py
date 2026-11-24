@@ -14,6 +14,8 @@ Uso:
   python etiquetar.py flota [--si]           Vehículo de la flota por campaña con Sonnet (3 fotos por campaña)
   python etiquetar.py flota-recoger          Recoge esa consulta: flota_campanas.csv y resultados_flota.csv
   python etiquetar.py indice --tandas a,b    Junta tandas en indice.json para el buscador del conector de Box
+  python etiquetar.py corregir --carpeta ID  Vuelve a etiquetar con Sonnet las fotos ya etiquetadas de esa carpeta
+         [--si]                              de Box (p. ej. al añadir una referencia de flota) y regenera el índice
 
 Solo LEE de Box. No escribe, mueve ni borra nada allí.
 """
@@ -84,7 +86,8 @@ EXTENSIONES = {"jpg", "jpeg", "png", "webp", "heic", "heif", "tif", "tiff"}
 FLOTA = ["13,80", "Airstream", "CajaMar", "Camión rígido", "Cotazero",
          "Furgón", "Plataformas", "Semirremolque", "Set TV"]
 
-# Una foto exterior de cada vehículo, del "Maestro vehículos (Claude)" en Box (Cotazero solo tiene planos).
+# Una foto exterior de cada vehículo, del "Maestro vehículos (Claude)" en Box. Las del Cotazero son de la campaña
+# de salud mental de Fundación Mapfre (2026), su única campaña por ahora.
 REFERENCIAS = [
     ("Airstream", "2400251591808", "remolque compacto rotulado que se abre por un lateral como escaparate, con rampa"),
     ("Furgón", "2400253604413", "furgoneta grande con carrocería tipo caja, puerta lateral, escalera y toldo"),
@@ -95,6 +98,9 @@ REFERENCIAS = [
     ("CajaMar", "2400551454784", "camión carrozado con escalera y rampa de acceso lateral"),
     ("Plataformas", "2400244907579", "módulo-remolque blanco grande tipo sala, con ventanas"),
     ("Set TV", "2400249995707", "módulo plató de TV con terraza superior"),
+    ("Cotazero", "2554417078817", "módulo prismático de cantos redondeados, a ras de suelo (cota cero), con un "
+                                  "lateral liso y largo; NO es la Airstream, que es una caravana corta de aluminio"),
+    ("Cotazero", "2554416174582", "el mismo Cotazero: a la derecha, pared lateral acristalada con puerta automática"),
 ]
 
 LINEAS = ["Roadshow", "Acciones pedagógicas y sensibilización", "Marca y patrocinio",
@@ -121,7 +127,7 @@ lista, sin inventar otros. Reglas:
 
 1. Describe solo lo que se ve. Si dudas, usa "desconocido" o confianza "baja". Nunca inventes.
 2. Vehículo de la flota ({", ".join(FLOTA)}): al principio del mensaje tienes una foto de referencia de cada \
-uno (salvo Cotazero). Elige uno de la flota solo si coincide claramente con su referencia en forma y estructura \
+uno. Elige uno de la flota solo si coincide claramente con su referencia en forma y estructura \
 (la rotulación cambia en cada campaña, no te fíes de los colores). Muchas fotos son de unidades fabricadas para \
 clientes, que NO son de la flota: en ese caso usa "otro vehículo". Si no hay vehículo, "sin vehículo".
 3. Marca: el nombre corto de la marca o cliente principal (p. ej. "Repsol", "Fundación DISA"), sin frases. \
@@ -868,7 +874,7 @@ def cmd_recoger(_args):
 FOTOS_POR_CAMPANA = int(os.getenv("FOTOS_POR_CAMPANA", "3"))
 
 SYSTEM_FLOTA = f"""Eres el responsable de flota de alegria-activity. Tienes las fotos de referencia de los \
-vehículos propios de la agencia ({", ".join(FLOTA)}; de Cotazero no hay foto) y varias fotos de UNA campaña. \
+vehículos propios de la agencia ({", ".join(FLOTA)}) y varias fotos de UNA campaña. \
 En una campaña se suele usar un mismo vehículo. Di qué vehículo o vehículos de la flota aparecen en las fotos de \
 la campaña, comparando forma, proporciones, número de ejes, cabina, partes expandibles y estructura con las \
 referencias. La rotulación cambia en cada campaña: no te fíes de colores ni logotipos. Muchas campañas usan \
@@ -1140,7 +1146,7 @@ def cmd_indice(args):
             fid = f["file_id"]
             rango = preferencia.index(f["modelo"]) if f.get("modelo") in preferencia else 9
             previo = registros.get(fid)
-            if previo and previo["_rango"] <= rango:
+            if previo and previo["_rango"] <= rango and d.parent.name != "correcciones":   # una corrección siempre gana
                 continue
             camp = f.get("campana") or campana_de(f["carpetas"].split(" | ")[0])
             anio = camp.split("/")[0] if es_anio(camp.split("/")[0]) else ""
@@ -1180,8 +1186,9 @@ NOCTURNO_MAX = int(os.getenv("NOCTURNO_MAX", "3000"))      # por encima no enví
 
 def _tandas_todas(base):
     fijas = [(base / t).resolve() for t in TANDAS_BASE]
-    noches = sorted(p for p in (base / "noche").glob("*") if p.is_dir()) if (base / "noche").exists() else []
-    return [d for d in fijas + noches if d.exists()]
+    extra = [p for sub in ("noche", "correcciones") if (base / sub).exists()
+             for p in sorted((base / sub).glob("*")) if p.is_dir()]
+    return [d for d in fijas + extra if d.exists()]
 
 
 def _ya_conocidas(tandas):
@@ -1324,6 +1331,53 @@ def cmd_nocturno(args):
     print("=== Fin ===" if r.returncode == 0 else "⚠ El índice ha fallado: sigue el anterior.", flush=True)
 
 
+MODELO_CORRECCION = os.getenv("MODELO_CORRECCION", "claude-sonnet-5-5")
+
+
+def cmd_corregir(args):
+    """Vuelve a etiquetar, con MODELO_CORRECCION (Sonnet), las fotos ya etiquetadas de una carpeta de Box, en una tanda
+    datos/correcciones/AAAAMMDD-<carpeta>, y regenera el índice. Como en el índice la ficha de Sonnet gana a la de Haiku,
+    la corrección sustituye a la ficha anterior sin tocar las otras tandas."""
+    import subprocess
+    if not args.carpeta:
+        sys.exit("Falta --carpeta <id de la carpeta de Box>.")
+    base = DATA
+    archivos = []
+    listar_carpeta(args.carpeta, "", archivos)
+    ids = {f["id"] for f in archivos}
+    shas = {f["sha1"] for f in archivos if f.get("sha1")}
+    print(f"Carpeta {args.carpeta}: {len(archivos)} imágenes")
+    elegidas = {}
+    for d in _tandas_todas(base):
+        if d.parent.name == "correcciones":
+            continue
+        for f in leer_json(d / "manifest.json", []) or []:
+            if any(i in ids for i in (f.get("ids") or [f["id"]])) or (f.get("sha1") and f["sha1"] in shas):
+                elegidas.setdefault(f.get("sha1") or f["id"], f)
+    if not elegidas:
+        sys.exit("Ninguna foto de esa carpeta está etiquetada todavía: no hay nada que corregir.")
+    print(f"Ya etiquetadas: {len(elegidas)} · sin etiquetar (las coge el nocturno): "
+          f"{len(archivos) - sum(1 for f in archivos if f['id'] in {i for e in elegidas.values() for i in (e.get('ids') or [e['id']])})}")
+    tanda = base / "correcciones" / f"{time.strftime('%Y%m%d')}-{args.carpeta}"
+    if (tanda / "resultados.csv").exists() and not args.forzar:
+        sys.exit(f"{tanda} ya tiene resultados (usa --forzar para repetirla).")
+    if args.forzar and tanda.exists():
+        for nombre in ("lotes.json", "enviadas.json", "resultados.csv"):
+            (tanda / nombre).unlink(missing_ok=True)
+    escribir_json(tanda / "manifest.json", list(elegidas.values()))
+    print(f"Tanda {tanda} con {MODELO_CORRECCION} (el coste se enseña antes de enviar)", flush=True)
+    r = subprocess.run([sys.executable, str(Path(__file__).resolve()), "todo"] + (["--si"] if args.si else []),
+                       env={**os.environ, "DATA_DIR": str(tanda), "MODELOS": MODELO_CORRECCION,
+                            "INCLUIR_RUTA": "true", "MAX_FOTOS": "1000000"}, check=False)
+    if r.returncode != 0 or not (tanda / "resultados.csv").exists():
+        sys.exit("La corrección no ha terminado: el índice no se toca. Repite el comando para reanudarla.")
+    indice = base / "indice.json"
+    if indice.exists():
+        (base / "indice_anterior.json").write_bytes(indice.read_bytes())
+    subprocess.run([sys.executable, str(Path(__file__).resolve()), "indice", "--tandas",
+                    ",".join(str(d) for d in _tandas_todas(base))], env={**os.environ, "DATA_DIR": str(base)}, check=False)
+
+
 def cmd_todo(args):
     if not MANIFEST.exists():
         cmd_listar(args)
@@ -1351,7 +1405,7 @@ def cmd_todo(args):
 def main():
     p = argparse.ArgumentParser(description="Piloto de etiquetado de fotos de Box con Claude")
     p.add_argument("comando", choices=["listar", "enviar", "estado", "recoger", "todo", "flota", "flota-recoger",
-                                          "indice", "importar", "nocturno"])
+                                          "indice", "importar", "nocturno", "corregir"])
     p.add_argument("--si", action="store_true", help="no pedir confirmación antes de enviar")
     p.add_argument("--forzar", action="store_true", help="sustituir el lote de los modelos indicados")
     p.add_argument("--modelos", help="modelos a enviar, separados por comas (por defecto, MODELOS)")
@@ -1363,12 +1417,13 @@ def main():
                    help="con enviar/todo: repite solo las fotos con ficha incompleta o error y las fusiona")
     p.add_argument("--csv", help="con importar: ruta o URL de seleccion_fotos.csv (o SELECCION_URL)")
     p.add_argument("--piloto", type=int, help="con importar: solo N oportunidades variadas")
+    p.add_argument("--carpeta", help="con corregir: id de la carpeta de Box cuyas fotos se vuelven a etiquetar")
     args = p.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
     {"listar": cmd_listar, "enviar": cmd_enviar, "estado": cmd_estado, "recoger": cmd_recoger,
      "todo": cmd_todo, "flota": cmd_flota, "flota-recoger": cmd_flota_recoger,
      "indice": cmd_indice, "importar": cmd_importar,
-     "nocturno": cmd_nocturno}[args.comando](args)
+     "nocturno": cmd_nocturno, "corregir": cmd_corregir}[args.comando](args)
 
 
 if __name__ == "__main__":
